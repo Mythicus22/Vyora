@@ -14,7 +14,7 @@ import com.vyora.domain.repository.MessageRepository
 object AppModule {
     fun provideDispatchers() = AppDispatchers()
     fun provideKeyManager() = KeyManager()
-    fun provideTransport(): MessageTransport = SimulatedTransport()
+    fun provideTransport(context: Context): MessageTransport = UsbSerialTransport(context)
     fun provideLocationRepository(context: Context) = LocationRepository(context)
     fun provideIdentityRepository(context: Context): IdentityRepository = IdentityRepositoryImpl(context)
     fun provideMessageRepository(transport: MessageTransport): MessageRepository = MessageRepositoryImpl(transport)

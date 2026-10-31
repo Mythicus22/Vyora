@@ -21,10 +21,17 @@ class OnboardingViewModel(
     val uiState: StateFlow<OnboardingUiState> = _uiState.asStateFlow()
 
     init {
+        // Pre-fill existing identity if previously saved so operator can edit/reconfigure
         viewModelScope.launch {
             identityRepository.identityFlow.collect { identity ->
                 if (identity != null) {
-                    _uiState.update { it.copy(existingIdentity = identity, isCompleted = true) }
+                    _uiState.update { current ->
+                        current.copy(
+                            existingIdentity = identity,
+                            generatedUserId = identity.userId.ifEmpty { current.generatedUserId },
+                            nickname = if (current.nickname.isEmpty()) identity.nickname else current.nickname
+                        )
+                    }
                 }
             }
         }
@@ -32,6 +39,18 @@ class OnboardingViewModel(
 
     fun onNicknameChanged(newNickname: String) {
         _uiState.update { it.copy(nickname = newNickname) }
+    }
+
+    fun onEmergencyRoleChanged(role: String) {
+        _uiState.update { it.copy(emergencyRole = role) }
+    }
+
+    fun onRadioBandChanged(band: String) {
+        _uiState.update { it.copy(radioBand = band) }
+    }
+
+    fun onEmergencyNoteChanged(note: String) {
+        _uiState.update { it.copy(emergencyNote = note) }
     }
 
     fun regenerateUserId() {

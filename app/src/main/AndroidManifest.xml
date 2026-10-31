@@ -18,6 +18,9 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Vyora">
+
+        <!-- OpenStreetMap & MapLibre open-source offline mapping (No paid SDKs required) -->
+
         <activity
             android:name="com.vyora.MainActivity"
             android:exported="true"
@@ -29,6 +32,14 @@
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Auto-detect ESP32 / USB Serial radio hardware attachment -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
         </activity>
     </application>
 

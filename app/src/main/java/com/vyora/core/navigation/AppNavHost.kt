@@ -58,10 +58,12 @@ fun AppNavHost(
         AppRoute.Messages.route
     )
 
+    val context = androidx.compose.ui.platform.LocalContext.current
     // ViewModels
     val onboardingViewModel = remember { OnboardingViewModel(identityRepository) }
     val deviceRepo = remember { DeviceRepositoryImpl(transport) }
-    val mapViewModel = remember { MapViewModel(locationProvider, deviceRepo) }
+    val offlineMapTileManager = remember { com.vyora.core.location.OfflineMapTileManager(context) }
+    val mapViewModel = remember { MapViewModel(locationProvider, deviceRepo, offlineMapTileManager) }
     val assistantRepo = remember { AssistantRepositoryImpl(EmergencyKnowledgeRepository()) }
     val assistantViewModel = remember { AssistantViewModel(assistantRepo) }
     val messagingViewModel = remember { MessagingViewModel(messageRepository) }
@@ -147,7 +149,7 @@ fun AppNavHost(
                 composable(AppRoute.Contacts.route) { ContactsScreen() }
                 composable(AppRoute.EmergencyGuides.route) { EmergencyGuidesScreen() }
                 composable(AppRoute.Settings.route) { SettingsScreen() }
-                composable(AppRoute.Diagnostics.route) { DiagnosticsScreen() }
+                composable(AppRoute.Diagnostics.route) { DiagnosticsScreen(transport = transport) }
             }
         }
 

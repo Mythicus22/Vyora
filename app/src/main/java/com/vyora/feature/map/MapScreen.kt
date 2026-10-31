@@ -1,17 +1,23 @@
 package com.vyora.feature.map
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Chat
-import androidx.compose.material.icons.filled.MyLocation
-import androidx.compose.material.icons.filled.PersonAdd
-import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -21,13 +27,26 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import com.vyora.BuildConfig
 import com.vyora.core.designsystem.theme.*
 import com.vyora.domain.model.NearbyDevice
 import com.vyora.domain.model.ReachabilityStatus
+import kotlinx.coroutines.launch
+import org.maplibre.android.camera.CameraPosition
+import org.maplibre.android.camera.CameraUpdateFactory
+import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.maps.MapLibreMap
+import org.maplibre.android.maps.MapView
+import org.maplibre.android.maps.Style
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -37,186 +56,620 @@ fun MapScreen(
     onTriggerSos: () -> Unit
 ) {
     val uiState by viewModel.uiState.collectAsState()
+    val coroutineScope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
     var showDirectIdDialog by remember { mutableStateOf(false) }
+    var mapLibreInstance by remember { mutableStateOf<MapLibreMap?>(null) }
+    var isMapLoaded by remember { mutableStateOf(false) }
+
+    val activeStyleUrl = remember(uiState.isSatelliteView) {
+        if (uiState.isSatelliteView) {
+            "https://tiles.openfreemap.org/styles/bright"
+        } else {
+            BuildConfig.MAP_STYLE_URL.ifEmpty { "https://tiles.openfreemap.org/styles/dark" }
+        }
+    }
+
+    // Keep camera positioned when coordinates update
+    LaunchedEffect(uiState.myCoordinates, mapLibreInstance) {
+        val coords = uiState.myCoordinates
+        val map = mapLibreInstance
+        if (coords != null && map != null) {
+            map.animateCamera(
+                CameraUpdateFactory.newLatLngZoom(
+                    LatLng(coords.latitude, coords.longitude),
+                    14.5
+                ),
+                1000
+            )
+        }
+    }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(VyoraNavyDark)
     ) {
-        // Radar Canvas
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val center = Offset(size.width / 2f, size.height * 0.45f)
-            val maxRadius = size.width * 0.48f
+        // 1. MapLibre Native SDK with OpenStreetMap Vector Tiles & Offline Cache
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                MapView(ctx).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    onCreate(null)
 
-            listOf(0.33f, 0.66f, 1.0f).forEach { ratio ->
-                drawCircle(
-                    color = VyoraCyanSecondary.copy(alpha = 0.2f),
-                    radius = maxRadius * ratio,
-                    center = center,
-                    style = Stroke(width = 1.dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))
-                )
-            }
-            drawLine(VyoraCyanSecondary.copy(alpha = 0.25f), Offset(center.x, center.y - maxRadius), Offset(center.x, center.y + maxRadius), 1.dp.toPx())
-            drawLine(VyoraCyanSecondary.copy(alpha = 0.25f), Offset(center.x - maxRadius, center.y), Offset(center.x + maxRadius, center.y), 1.dp.toPx())
-            drawCircle(VyoraCyanSecondary.copy(alpha = 0.35f), 18.dp.toPx(), center)
-            drawCircle(VyoraCyanSecondary, 7.dp.toPx(), center)
-        }
+                    // Bind MapView lifecycle to Compose lifecycle
+                    val observer = object : DefaultLifecycleObserver {
+                        override fun onStart(owner: LifecycleOwner) = onStart()
+                        override fun onResume(owner: LifecycleOwner) = onResume()
+                        override fun onPause(owner: LifecycleOwner) = onPause()
+                        override fun onStop(owner: LifecycleOwner) = onStop()
+                        override fun onDestroy(owner: LifecycleOwner) = onDestroy()
+                    }
+                    lifecycleOwner.lifecycle.addObserver(observer)
 
-        // Tactical Markers
-        uiState.nearbyDevices.forEachIndexed { index, device ->
-            val angleRad = (index * 85.0 + 30.0) * (Math.PI / 180.0)
-            val distFraction = 0.25 + (index % 3) * 0.28
-            val markerColor = when (device.reachability) {
-                ReachabilityStatus.REACHABLE_DIRECT -> VyoraMeshGreen
-                ReachabilityStatus.REACHABLE_RELAY -> VyoraCyanSecondary
-                else -> Color(0xFFFACC15)
-            }
+                    getMapAsync { map ->
+                        mapLibreInstance = map
+                        map.uiSettings.isCompassEnabled = false
+                        map.uiSettings.isLogoEnabled = false
+                        map.uiSettings.isAttributionEnabled = false
 
-            Box(modifier = Modifier.fillMaxSize().padding(bottom = 80.dp), contentAlignment = Alignment.Center) {
-                Box(
-                    modifier = Modifier
-                        .offset(
-                            x = (Math.cos(angleRad) * 130 * distFraction).dp,
-                            y = (Math.sin(angleRad) * 130 * distFraction - 40).dp
-                        )
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(VyoraNavyCard.copy(alpha = 0.9f))
-                        .border(1.dp, markerColor, RoundedCornerShape(8.dp))
-                        .clickable { viewModel.selectDevice(device) }
-                        .padding(horizontal = 8.dp, vertical = 6.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(markerColor))
-                        Text(device.nickname, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = VyoraTextPrimary)
+                        val initialLat = uiState.myCoordinates?.latitude ?: 37.7749
+                        val initialLng = uiState.myCoordinates?.longitude ?: -122.4194
+                        map.cameraPosition = CameraPosition.Builder()
+                            .target(LatLng(initialLat, initialLng))
+                            .zoom(14.5)
+                            .build()
+
+                        map.setStyle(Style.Builder().fromUri(activeStyleUrl)) {
+                            isMapLoaded = true
+                            refreshMapMarkers(map, uiState, onDeviceClick = { dev ->
+                                viewModel.selectDevice(dev)
+                            })
+                        }
+
+                        map.setOnMarkerClickListener { marker ->
+                            val clicked = uiState.nearbyDevices.find { it.nickname == marker.title }
+                            if (clicked != null) {
+                                viewModel.selectDevice(clicked)
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                }
+            },
+            update = { mapView ->
+                mapLibreInstance?.let { map ->
+                    if (isMapLoaded) {
+                        refreshMapMarkers(map, uiState, onDeviceClick = { dev ->
+                            viewModel.selectDevice(dev)
+                        })
                     }
                 }
             }
+        )
+
+        // 2. Tactical MGRS Radar / Range Ring Canvas Overlay
+        if (uiState.isRadarOverlayVisible && !uiState.isSatelliteView) {
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = 60.dp)
+            ) {
+                val center = Offset(size.width / 2f, size.height * 0.46f)
+                val maxRadius = size.width * 0.44f
+
+                // Radar Range Rings (0.5km, 1.5km, 3.0km)
+                listOf(0.35f, 0.68f, 1.0f).forEach { ratio ->
+                    drawCircle(
+                        color = VyoraCyanSecondary.copy(alpha = 0.16f),
+                        radius = maxRadius * ratio,
+                        center = center,
+                        style = Stroke(
+                            width = 1.dp.toPx(),
+                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
+                        )
+                    )
+                }
+
+                // Coordinate Reticle Lines
+                drawLine(
+                    color = VyoraCyanSecondary.copy(alpha = 0.20f),
+                    start = Offset(center.x, center.y - maxRadius),
+                    end = Offset(center.x, center.y + maxRadius),
+                    strokeWidth = 1.dp.toPx(),
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f), 0f)
+                )
+                drawLine(
+                    color = VyoraCyanSecondary.copy(alpha = 0.20f),
+                    start = Offset(center.x - maxRadius, center.y),
+                    end = Offset(center.x + maxRadius, center.y),
+                    strokeWidth = 1.dp.toPx(),
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(4f, 4f), 0f)
+                )
+            }
         }
 
-        // HUD Bar
+        // 3. Top HUD: Mesh Health & Telemetry Strip
         Column(
-            modifier = Modifier.fillMaxWidth().statusBarsPadding().padding(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            // Offline Tile Cache Progress Notification
+            AnimatedVisibility(visible = uiState.offlineProgress.isDownloading || uiState.offlineProgress.isComplete) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(VyoraNavyDark.copy(alpha = 0.95f))
+                        .border(1.dp, if (uiState.offlineProgress.isComplete) VyoraMeshGreen else VyoraCyanSecondary, RoundedCornerShape(10.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (uiState.offlineProgress.isDownloading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            color = VyoraCyanSecondary,
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = null,
+                            tint = VyoraMeshGreen,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                    Text(
+                        text = uiState.offlineProgress.statusText,
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (uiState.offlineProgress.isComplete) VyoraMeshGreen else VyoraCyanSecondary
+                    )
+                }
+            }
+
+            // Main Telemetry Card
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(12.dp))
-                    .background(VyoraNavyCard.copy(alpha = 0.92f))
+                    .background(VyoraNavyCard.copy(alpha = 0.94f))
                     .border(1.dp, VyoraNavyBorder, RoundedCornerShape(12.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(VyoraMeshGreen))
-                    Text("ACTIVE MESH: ${uiState.nearbyDevices.size} NODES", fontFamily = FontFamily.Monospace, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = VyoraMeshGreen)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(9.dp)
+                            .clip(CircleShape)
+                            .background(VyoraMeshGreen)
+                    )
+                    Column {
+                        Text(
+                            text = "OPENSTREETMAP TACTICAL RADAR",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = VyoraMeshGreen,
+                            letterSpacing = 1.sp
+                        )
+                        Text(
+                            text = "${uiState.nearbyDevices.size} NODES • MapLibre Vector Engine",
+                            fontSize = 10.sp,
+                            color = VyoraCyanLight
+                        )
+                    }
                 }
-                IconButton(onClick = { showDirectIdDialog = true }, modifier = Modifier.size(28.dp)) {
-                    Icon(imageVector = Icons.Default.PersonAdd, contentDescription = "Address by ID", tint = VyoraCyanSecondary)
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    // Cache Nearby Offline Tiles Button
+                    IconButton(
+                        onClick = { viewModel.cacheCurrentRegion(activeStyleUrl) },
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(VyoraNavyHighlight)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Download,
+                            contentDescription = "Cache Offline Tiles",
+                            tint = VyoraMeshGreen,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    // Direct ID Lookup Button
+                    IconButton(
+                        onClick = { showDirectIdDialog = true },
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(VyoraNavyHighlight)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PersonAdd,
+                            contentDescription = "Address Node ID",
+                            tint = VyoraCyanSecondary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
             }
 
+            // Technical Grid Coordinate Readout Strip
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
-                    .background(VyoraNavyContainer.copy(alpha = 0.85f))
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
+                    .background(VyoraNavyContainer.copy(alpha = 0.90f))
+                    .border(0.5.dp, VyoraNavyBorder, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Explore,
+                        contentDescription = null,
+                        tint = VyoraCyanSecondary,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Text(
+                        text = uiState.myCoordinates?.let {
+                            String.format("GRID: %.4f°N, %.4f°W", it.latitude, it.longitude)
+                        } ?: "GPS ACQUIRING FIX...",
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = VyoraCyanSecondary
+                    )
+                }
+
                 Text(
-                    text = uiState.myCoordinates?.let { String.format("GPS: %.4f°N, %.4f°W", it.latitude, it.longitude) } ?: "ACQUIRING FIX...",
+                    text = "RADAR: 4.8 km • ACC: ±${uiState.myCoordinates?.accuracy?.toInt() ?: 12}m",
                     fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    color = VyoraTextPrimary
+                    fontSize = 10.sp,
+                    color = VyoraTextSecondary
                 )
-                Text(text = "RADAR: 4.8 km", fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = VyoraCyanLight)
-            }
-        }
-
-        // Floating Action Buttons
-        Column(
-            modifier = Modifier.align(Alignment.BottomEnd).padding(end = 16.dp, bottom = 100.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            FloatingActionButton(
-                onClick = { viewModel.recenterGps() },
-                containerColor = VyoraNavyCard,
-                contentColor = VyoraCyanSecondary,
-                modifier = Modifier.size(48.dp)
-            ) {
-                Icon(imageVector = Icons.Default.MyLocation, contentDescription = "Recenter")
             }
 
-            FloatingActionButton(
-                onClick = onTriggerSos,
-                containerColor = VyoraEmergencyOrange,
-                contentColor = Color.White,
-                modifier = Modifier.size(56.dp)
+            // Quick Filter Pills
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(imageVector = Icons.Default.Warning, contentDescription = null)
-                    Text("SOS", fontSize = 10.sp, fontWeight = FontWeight.Black)
+                MapFilterCategory.values().forEach { category ->
+                    val isSelected = uiState.activeFilter == category
+                    val count = when (category) {
+                        MapFilterCategory.ALL -> uiState.nearbyDevices.size
+                        MapFilterCategory.SOS -> uiState.nearbyDevices.count { it.nickname.contains("SOS", true) }
+                        MapFilterCategory.MEDICAL -> uiState.nearbyDevices.count { it.nickname.contains("Medic", true) }
+                        MapFilterCategory.RELAY -> uiState.nearbyDevices.count { it.nickname.contains("Relay", true) }
+                    }
+
+                    FilterChip(
+                        selected = isSelected,
+                        onClick = { viewModel.setFilter(category) },
+                        label = {
+                            Text(
+                                text = "${category.label} ($count)",
+                                fontSize = 11.sp,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        },
+                        colors = FilterChipDefaults.filterChipColors(
+                            containerColor = VyoraNavyCard,
+                            labelColor = VyoraTextSecondary,
+                            selectedContainerColor = if (category == MapFilterCategory.SOS) VyoraEmergencyOrange else VyoraCyanSecondary,
+                            selectedLabelColor = VyoraNavyDark
+                        ),
+                        border = FilterChipDefaults.filterChipBorder(
+                            enabled = true,
+                            selected = isSelected,
+                            borderColor = VyoraNavyBorder,
+                            selectedBorderColor = VyoraCyanSecondary
+                        ),
+                        shape = RoundedCornerShape(8.dp)
+                    )
                 }
             }
         }
 
-        // Bottom Sheet for selected node
-        uiState.selectedDevice?.let { dev ->
-            ModalBottomSheet(
-                onDismissRequest = { viewModel.selectDevice(null) },
-                containerColor = VyoraNavyCard
+        // 4. Tactical Control Buttons (Right Side Vertical Rail)
+        Column(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            // Layer Toggle (Dark Map / Street Map)
+            IconButton(
+                onClick = { viewModel.toggleSatelliteView() },
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(VyoraNavyCard)
+                    .border(1.dp, if (uiState.isSatelliteView) VyoraCyanSecondary else VyoraNavyBorder, RoundedCornerShape(10.dp))
             ) {
-                Column(modifier = Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Text(dev.nickname, fontSize = 22.sp, fontWeight = FontWeight.Bold, color = VyoraTextPrimary)
-                    Text("ID: ${dev.deviceId}", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = VyoraCyanLight)
-                    Button(
-                        onClick = {
-                            val id = dev.deviceId
-                            viewModel.selectDevice(null)
-                            onStartChat(id)
-                        },
-                        modifier = Modifier.fillMaxWidth().height(50.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = VyoraCyanSecondary, contentColor = VyoraNavyDark),
-                        shape = RoundedCornerShape(12.dp)
+                Icon(
+                    imageVector = Icons.Default.Layers,
+                    contentDescription = "Toggle Layer",
+                    tint = if (uiState.isSatelliteView) VyoraCyanSecondary else VyoraTextSecondary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            // Radar Ring Overlay Toggle
+            IconButton(
+                onClick = { viewModel.toggleRadarOverlay() },
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(VyoraNavyCard)
+                    .border(1.dp, if (uiState.isRadarOverlayVisible) VyoraMeshGreen else VyoraNavyBorder, RoundedCornerShape(10.dp))
+            ) {
+                Icon(
+                    imageVector = Icons.Default.WifiTethering,
+                    contentDescription = "Toggle Radar Grid",
+                    tint = if (uiState.isRadarOverlayVisible) VyoraMeshGreen else VyoraTextSecondary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            // Offline Cache Region Trigger
+            IconButton(
+                onClick = { viewModel.cacheCurrentRegion(activeStyleUrl) },
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(VyoraNavyCard)
+                    .border(1.dp, VyoraNavyBorder, RoundedCornerShape(10.dp))
+            ) {
+                Icon(
+                    imageVector = Icons.Default.CloudDownload,
+                    contentDescription = "Cache Region",
+                    tint = VyoraCyanSecondary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            // Recenter GPS Button
+            IconButton(
+                onClick = {
+                    viewModel.recenterGps()
+                    uiState.myCoordinates?.let { coords ->
+                        mapLibreInstance?.animateCamera(
+                            CameraUpdateFactory.newLatLngZoom(
+                                LatLng(coords.latitude, coords.longitude),
+                                14.5
+                            ),
+                            800
+                        )
+                    }
+                },
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(VyoraNavyCard)
+                    .border(1.dp, VyoraNavyBorder, RoundedCornerShape(10.dp))
+            ) {
+                Icon(
+                    imageVector = Icons.Default.MyLocation,
+                    contentDescription = "Recenter GPS",
+                    tint = VyoraCyanSecondary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            // Emergency SOS Action Button
+            IconButton(
+                onClick = onTriggerSos,
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(VyoraEmergencyOrange)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Warning,
+                    contentDescription = "Trigger SOS",
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+        }
+
+        // 5. Selected Node Detail Bottom Card
+        AnimatedVisibility(
+            visible = uiState.selectedDevice != null,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .padding(14.dp)
+        ) {
+            uiState.selectedDevice?.let { device ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(VyoraNavyCard)
+                        .border(1.dp, VyoraCyanSecondary, RoundedCornerShape(16.dp))
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("OPEN SECURE MESH CHAT", fontWeight = FontWeight.Bold)
+                        Column {
+                            Text(
+                                text = device.nickname,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp,
+                                color = VyoraTextPrimary
+                            )
+                            Text(
+                                text = "NODE ID: ${device.deviceId}",
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                color = VyoraCyanLight
+                            )
+                        }
+
+                        IconButton(onClick = { viewModel.selectDevice(null) }) {
+                            Icon(imageVector = Icons.Default.Close, contentDescription = "Close", tint = VyoraTextSecondary)
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column {
+                            Text("LINK STATUS", fontSize = 10.sp, color = VyoraTextSecondary, fontFamily = FontFamily.Monospace)
+                            Text(
+                                text = if (device.reachability == ReachabilityStatus.REACHABLE_DIRECT) "DIRECT (1 HOP)" else "MESH RELAY (${device.hopCount} HOPS)",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (device.reachability == ReachabilityStatus.REACHABLE_DIRECT) VyoraMeshGreen else VyoraCyanSecondary
+                            )
+                        }
+                        Column {
+                            Text("SIGNAL (RSSI)", fontSize = 10.sp, color = VyoraTextSecondary, fontFamily = FontFamily.Monospace)
+                            Text("${device.rssi} dBm", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = VyoraTextPrimary)
+                        }
+                        Column {
+                            Text("RADIO BAND", fontSize = 10.sp, color = VyoraTextSecondary, fontFamily = FontFamily.Monospace)
+                            Text("915 MHz ISM", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = VyoraTextPrimary)
+                        }
+                    }
+
+                    Button(
+                        onClick = { onStartChat(device.deviceId) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = VyoraCyanSecondary,
+                            contentColor = VyoraNavyDark
+                        )
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(imageVector = Icons.Default.Chat, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Text("OPEN PRIVATE MESH CHAT", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        }
                     }
                 }
             }
         }
 
+        // 6. Direct Node ID Lookup Dialog
         if (showDirectIdDialog) {
             var directInput by remember { mutableStateOf("") }
             AlertDialog(
                 onDismissRequest = { showDirectIdDialog = false },
                 containerColor = VyoraNavyCard,
-                title = { Text("Direct Node Addressing", color = VyoraTextPrimary) },
+                title = { Text("Direct Node Addressing", color = VyoraTextPrimary, fontWeight = FontWeight.Bold) },
                 text = {
-                    OutlinedTextField(
-                        value = directInput,
-                        onValueChange = { directInput = it.uppercase() },
-                        placeholder = { Text("VYO-XXXX-XXXX") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "Enter any peer unique ID (e.g. VYO-XXXX-XXXX). Packets queue locally and route when radio connectivity or relays are found.",
+                            fontSize = 12.sp,
+                            color = VyoraTextSecondary
+                        )
+                        OutlinedTextField(
+                            value = directInput,
+                            onValueChange = { directInput = it.uppercase() },
+                            placeholder = { Text("VYO-XXXX-XXXX") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                 },
                 confirmButton = {
-                    Button(onClick = {
-                        val clean = directInput.trim()
-                        if (clean.isNotEmpty()) {
-                            showDirectIdDialog = false
-                            onStartChat(clean)
-                        }
-                    }, colors = ButtonDefaults.buttonColors(containerColor = VyoraCyanSecondary, contentColor = VyoraNavyDark)) {
-                        Text("Open Chat")
+                    Button(
+                        onClick = {
+                            val clean = directInput.trim()
+                            if (clean.isNotEmpty()) {
+                                showDirectIdDialog = false
+                                onStartChat(clean)
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = VyoraCyanSecondary,
+                            contentColor = VyoraNavyDark
+                        )
+                    ) {
+                        Text("Open Conversation")
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showDirectIdDialog = false }) { Text("Cancel", color = VyoraTextSecondary) }
+                    TextButton(onClick = { showDirectIdDialog = false }) {
+                        Text("Cancel", color = VyoraTextSecondary)
+                    }
                 }
+            )
+        }
+    }
+}
+
+/**
+ * Updates markers on the MapLibreMap instance without creating memory leaks
+ */
+private fun refreshMapMarkers(
+    map: MapLibreMap,
+    uiState: MapUiState,
+    onDeviceClick: (NearbyDevice) -> Unit
+) {
+    map.clear()
+
+    // Add Self Node marker
+    uiState.myCoordinates?.let { coords ->
+        map.addMarker(
+            org.maplibre.android.annotations.MarkerOptions()
+                .position(LatLng(coords.latitude, coords.longitude))
+                .title("YOU (Local Terminal)")
+                .snippet("Self Node • Active GPS Fix")
+        )
+    }
+
+    // Add Discovered Peer Markers
+    uiState.filteredDevices.forEach { device ->
+        if (device.latitude != null && device.longitude != null) {
+            map.addMarker(
+                org.maplibre.android.annotations.MarkerOptions()
+                    .position(LatLng(device.latitude, device.longitude))
+                    .title(device.nickname)
+                    .snippet("ID: ${device.deviceId} • RSSI: ${device.rssi}dBm")
             )
         }
     }

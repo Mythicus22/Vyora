@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Common ESP32 / USB-to-UART Bridges: CP210x, CH340, FTDI, CDC ACM -->
+    <!-- CP2102 / CP2104: Silicon Labs (0x10C4) -->
+    <usb-device vendor-id="4292" />
+    <!-- CH340 / CH341: QinHeng Electronics (0x1A86) -->
+    <usb-device vendor-id="6790" />
+    <!-- FTDI FT232R / etc: (0x0403) -->
+    <usb-device vendor-id="1027" />
+    <!-- Espressif ESP32-S2/S3 Native USB (0x303A) -->
+    <usb-device vendor-id="12346" />
+</resources>

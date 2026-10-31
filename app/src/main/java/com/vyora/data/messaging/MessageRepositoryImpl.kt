@@ -13,7 +13,45 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
 
-class MessageRepositoryImpl(private val transport: MessageTransport) : MessageRepository {
+import com.vyora.communication.radio.UsbSerialTransport
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+
+class MessageRepositoryImpl(
+    private val transport: MessageTransport,
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+) : MessageRepository {
+
+    init {
+        if (transport is UsbSerialTransport) {
+            scope.launch {
+                transport.receivedMessages.collect { incoming ->
+                    receiveIncomingMessage(incoming)
+                }
+            }
+        }
+    }
+
+    private fun receiveIncomingMessage(incoming: Message) {
+        val targetPeer = incoming.senderId
+        val currentList = _messages.value[targetPeer]?.toMutableList() ?: mutableListOf()
+        currentList.add(incoming)
+        _messages.value = _messages.value.toMutableMap().apply { put(targetPeer, currentList) }
+
+        val convList = _conversations.value.toMutableList()
+        val existingIndex = convList.indexOfFirst { it.recipientId == targetPeer }
+        val updatedConv = Conversation(
+            id = if (existingIndex >= 0) convList[existingIndex].id else UUID.randomUUID().toString(),
+            recipientId = targetPeer,
+            recipientNickname = if (existingIndex >= 0) convList[existingIndex].recipientNickname else "Remote Radio Node",
+            lastMessageText = incoming.text,
+            lastMessageTimestamp = System.currentTimeMillis(),
+            unreadCount = (if (existingIndex >= 0) convList[existingIndex].unreadCount else 0) + 1
+        )
+        if (existingIndex >= 0) convList[existingIndex] = updatedConv else convList.add(0, updatedConv)
+        _conversations.value = convList
+    }
 
     private val _conversations = MutableStateFlow<List<Conversation>>(
         listOf(
