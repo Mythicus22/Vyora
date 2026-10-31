@@ -119,11 +119,13 @@ fun MapScreen(
                         map.uiSettings.isLogoEnabled = false
                         map.uiSettings.isAttributionEnabled = false
 
-                        val initialLat = uiState.myCoordinates?.latitude ?: 37.7749
-                        val initialLng = uiState.myCoordinates?.longitude ?: -122.4194
+                        val coords = uiState.myCoordinates
+                        val initialLat = coords?.latitude ?: 0.0
+                        val initialLng = coords?.longitude ?: 0.0
+                        val initialZoom = if (coords != null) 14.5 else 1.0
                         map.cameraPosition = CameraPosition.Builder()
                             .target(LatLng(initialLat, initialLng))
-                            .zoom(14.5)
+                            .zoom(initialZoom)
                             .build()
 
                         map.setStyle(Style.Builder().fromUri(activeStyleUrl)) {
@@ -225,7 +227,7 @@ fun MapScreen(
                         )
                     } else {
                         Icon(
-                            imageVector = Icons.Default.CheckCircle,
+                            imageVector = Icons.Default.CheckCircleOutline,
                             contentDescription = null,
                             tint = VyoraMeshGreen,
                             modifier = Modifier.size(18.dp)
@@ -339,7 +341,9 @@ fun MapScreen(
                     )
                     Text(
                         text = uiState.myCoordinates?.let {
-                            String.format("GRID: %.4f°N, %.4f°W", it.latitude, it.longitude)
+                            val latDir = if (it.latitude >= 0) "N" else "S"
+                            val lngDir = if (it.longitude >= 0) "E" else "W"
+                            String.format(java.util.Locale.US, "GRID: %.4f°%s, %.4f°%s", Math.abs(it.latitude), latDir, Math.abs(it.longitude), lngDir)
                         } ?: "GPS ACQUIRING FIX...",
                         fontFamily = FontFamily.Monospace,
                         fontSize = 10.sp,

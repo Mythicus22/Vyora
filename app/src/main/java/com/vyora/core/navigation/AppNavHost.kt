@@ -64,7 +64,7 @@ fun AppNavHost(
     val deviceRepo = remember { DeviceRepositoryImpl(transport) }
     val offlineMapTileManager = remember { com.vyora.core.location.OfflineMapTileManager(context) }
     val mapViewModel = remember { MapViewModel(locationProvider, deviceRepo, offlineMapTileManager) }
-    val assistantRepo = remember { AssistantRepositoryImpl(EmergencyKnowledgeRepository()) }
+    val assistantRepo = remember { AssistantRepositoryImpl(context.applicationContext, EmergencyKnowledgeRepository()) }
     val assistantViewModel = remember { AssistantViewModel(assistantRepo) }
     val messagingViewModel = remember { MessagingViewModel(messageRepository) }
     val sosViewModel = remember { SosViewModel(messageRepository) }

@@ -13,4 +13,6 @@ data class LocationCoordinates(
 interface LocationProvider {
     val coordinates: StateFlow<LocationCoordinates?>
     suspend fun getCurrentFix(): LocationCoordinates?
+    fun startLocationUpdates() {}
+    fun stopLocationUpdates() {}
 }

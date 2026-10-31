@@ -30,6 +30,29 @@ class MessageRepositoryImpl(
                     receiveIncomingMessage(incoming)
                 }
             }
+            scope.launch {
+                transport.messageStatusUpdates.collect { (msgId, status) ->
+                    updateMessageStatus(msgId, status)
+                }
+            }
+        }
+    }
+
+    private fun updateMessageStatus(appMsgId: String, newStatus: MessageDeliveryStatus) {
+        val allMsgs = _messages.value.toMutableMap()
+        var updated = false
+        for ((peer, list) in allMsgs) {
+            val idx = list.indexOfFirst { it.id == appMsgId }
+            if (idx >= 0) {
+                val updatedList = list.toMutableList()
+                updatedList[idx] = updatedList[idx].copy(status = newStatus)
+                allMsgs[peer] = updatedList
+                updated = true
+                break
+            }
+        }
+        if (updated) {
+            _messages.value = allMsgs
         }
     }
 

@@ -10,13 +10,13 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.hoho.android.usbserial.driver.UsbSerialDriver
 import com.hoho.android.usbserial.driver.UsbSerialPort
 import com.hoho.android.usbserial.driver.UsbSerialProber
 import com.hoho.android.usbserial.util.SerialInputOutputManager
 import com.vyora.communication.MessageTransport
 import com.vyora.communication.TransportState
-import com.vyora.domain.model.EmergencyCategory
 import com.vyora.domain.model.Message
 import com.vyora.domain.model.MessageDeliveryStatus
 import com.vyora.domain.model.MessageType
@@ -35,18 +35,26 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.IOException
 import java.nio.charset.StandardCharsets
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Robust USB-to-Serial transport implementation for VYORA.
+ * Production-ready USB-to-Serial transport implementation for VYORA.
  *
- * Interfaces directly with the ESP32 DevKit running the bench test firmware (nrf_pa_tx / nrf_pa_rx).
- * Serial parameters per ANDROID_HARDWARE_INTEGRATION.md:
- * - Baud rate: 115200 baud
- * - Framing: 8 data bits, no parity, 1 stop bit (8N1)
- * - Line protocol: UTF-8 newline-terminated strings ('\n', max 31 ASCII chars for bench radio)
- * - Incoming stream: continuously buffered and split on '\n' (trimming trailing '\r')
+ * Implements the VYORA Node Protocol (v1) defined in nrf.md and nrf_mesh_node.ino:
+ * - 115200 baud, 8N1.
+ * - JSON Lines (JSONL) framing: one UTF-8 JSON object per line ending in '\n'.
+ * - Outgoing commands:
+ *     status, set_profile, set_location, send, test (serial_loopback), set_node_id
+ * - Incoming events:
+ *     ready, status, node_seen, tx_status, message, delivered, delivery_timeout, error, test_result
+ * - Monotonic 8-hex digit message sequence IDs per sender.
+ * - Peer directory maintaining mapping between radio node IDs (8-hex) and VYORA user IDs.
+ * - Backward compatibility fallback for bench-test sketches.
  */
 class UsbSerialTransport(
     private val context: Context,
@@ -60,7 +68,19 @@ class UsbSerialTransport(
         const val DATA_BITS = UsbSerialPort.DATABITS_8
         const val STOP_BITS = UsbSerialPort.STOPBITS_1
         const val PARITY = UsbSerialPort.PARITY_NONE
+        const val MAX_RADIO_MESSAGE_BYTES = 280
     }
+
+    data class PeerRecord(
+        val nodeId: String,
+        val userId: String = "",
+        val callsign: String = "",
+        val hops: Int = 1,
+        val latitude: Double? = null,
+        val longitude: Double? = null,
+        val rpd: Boolean? = null,
+        val lastSeenMs: Long = System.currentTimeMillis()
+    )
 
     private val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
 
@@ -79,7 +99,17 @@ class UsbSerialTransport(
     private val _discoveredDevices = MutableStateFlow<List<NearbyDevice>>(emptyList())
     override val discoveredDevices: StateFlow<List<NearbyDevice>> = _discoveredDevices.asStateFlow()
 
-    // Exposes raw lines received from ESP32 for diagnostics or messaging router
+    // Local Node Telemetry from ESP32
+    private val _localNodeId = MutableStateFlow<String?>(null)
+    val localNodeId: StateFlow<String?> = _localNodeId.asStateFlow()
+
+    private val _radioStatus = MutableStateFlow("unknown")
+    val radioStatus: StateFlow<String> = _radioStatus.asStateFlow()
+
+    private val _neighborsCount = MutableStateFlow(0)
+    val neighborsCount: StateFlow<Int> = _neighborsCount.asStateFlow()
+
+    // Exposes raw lines received from ESP32 for diagnostics or operator console
     private val _incomingLines = MutableSharedFlow<String>(extraBufferCapacity = 64)
     val incomingLines: SharedFlow<String> = _incomingLines.asSharedFlow()
 
@@ -87,7 +117,27 @@ class UsbSerialTransport(
     private val _receivedMessages = MutableSharedFlow<Message>(extraBufferCapacity = 64)
     val receivedMessages: SharedFlow<Message> = _receivedMessages.asSharedFlow()
 
-    override val transportName: String = "ESP32-USB-SERIAL (115200 8N1)"
+    // Exposes asynchronous delivery status updates: Pair<AppMessageUUID, MessageDeliveryStatus>
+    private val _messageStatusUpdates = MutableSharedFlow<Pair<String, MessageDeliveryStatus>>(extraBufferCapacity = 64)
+    val messageStatusUpdates: SharedFlow<Pair<String, MessageDeliveryStatus>> = _messageStatusUpdates.asSharedFlow()
+
+    // Discovered peer table keyed by 8-hex radio node ID
+    private val peerTable = ConcurrentHashMap<String, PeerRecord>()
+    private val userIdToNodeId = ConcurrentHashMap<String, String>()
+    private val callsignToNodeId = ConcurrentHashMap<String, String>()
+
+    // Message tracking: hexMessageId -> appMessageId (UUID)
+    private val messageIdMap = ConcurrentHashMap<String, String>()
+    private val messageCounter = AtomicInteger(((System.currentTimeMillis() / 1000) and 0xFFFF).toInt())
+
+    // Cached profile & location to auto-announce on handshake
+    private var localUserId: String = ""
+    private var localCallsign: String = ""
+    private var lastLatitude: Double? = null
+    private var lastLongitude: Double? = null
+    private var locationSharingEnabled: Boolean = true
+
+    override val transportName: String = "ESP32 Mesh Node (115200 8N1 JSONL)"
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(receiverContext: Context?, intent: Intent?) {
@@ -132,11 +182,7 @@ class UsbSerialTransport(
                 addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
                 addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                context.registerReceiver(usbReceiver, filter)
-            }
+            ContextCompat.registerReceiver(context, usbReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
             isReceiverRegistered = true
         }
 
@@ -155,9 +201,6 @@ class UsbSerialTransport(
         }
     }
 
-    /**
-     * Enumerates connected USB drivers using UsbSerialProber
-     */
     suspend fun connectAvailableDevice() = withContext(Dispatchers.IO) {
         _state.value = TransportState.CONNECTING
         _statusMessage.value = "Enumerating USB serial drivers..."
@@ -227,7 +270,6 @@ class UsbSerialTransport(
             port.open(connection)
             port.setParameters(BAUD_RATE, DATA_BITS, STOP_BITS, PARITY)
 
-            // Optional: assert DTR/RTS as required by some UART bridge chips
             try {
                 port.dtr = true
                 port.rts = true
@@ -238,18 +280,21 @@ class UsbSerialTransport(
             usbConnection = connection
             usbSerialPort = port
 
-            // Start asynchronous I/O thread
+            synchronized(readBuffer) {
+                readBuffer.setLength(0)
+            }
+
             val manager = SerialInputOutputManager(port, this@UsbSerialTransport)
             ioManager = manager
             manager.start()
 
             _state.value = TransportState.CONNECTED
             val chipName = driver.javaClass.simpleName.replace("SerialDriver", "")
-            _statusMessage.value = "ESP32 Linked ($chipName) @ 115200 8N1"
+            _statusMessage.value = "ESP32 Linked ($chipName) @ 115200 8N1. Querying node status..."
             Log.i(TAG, "Serial port opened successfully: $chipName")
 
-            // Automatically populate peer node based on bench test protocol
-            updateHardwareNodePresence("Radio-Peer", ReachabilityStatus.REACHABLE_DIRECT)
+            // Initial node handshake per nrf.md
+            performInitialHandshake()
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to open serial port", e)
@@ -286,13 +331,13 @@ class UsbSerialTransport(
 
         _state.value = TransportState.DISCONNECTED
         _statusMessage.value = "Hardware disconnected. Reconnect OTG cable."
-        _discoveredDevices.value = emptyList()
+        _localNodeId.value = null
+        _radioStatus.value = "offline"
+        _neighborsCount.value = 0
     }
 
     /**
-     * Sends newline-terminated text to the ESP32.
-     * Per ANDROID_HARDWARE_INTEGRATION.md:
-     * Writes UTF-8 text appended with '\n' (up to 31 ASCII chars for the current bench test radio).
+     * Sends a raw line ending with '\n' to the ESP32 node.
      */
     suspend fun sendLine(line: String): Boolean = withContext(Dispatchers.IO) {
         val port = usbSerialPort
@@ -303,7 +348,7 @@ class UsbSerialTransport(
 
         return@withContext try {
             val payload = (line.trimEnd('\r', '\n') + "\n").toByteArray(StandardCharsets.UTF_8)
-            port.write(payload, 1500)
+            port.write(payload, 2000)
             Log.d(TAG, "Sent over serial: $line")
             true
         } catch (e: IOException) {
@@ -312,24 +357,215 @@ class UsbSerialTransport(
         }
     }
 
+    // --- Outgoing Protocol Commands (per nrf.md & nrf_mesh_node.ino) ---
+
+    /**
+     * Handshake immediately upon connecting:
+     * 1. Query current ESP32 status {"cmd":"status"}
+     * 2. Announce profile if configured {"cmd":"set_profile",...}
+     * 3. Sync phone GPS location if available {"cmd":"set_location",...}
+     */
+    private fun performInitialHandshake() {
+        scope.launch {
+            // Request node status
+            sendLine("{\"cmd\":\"status\"}")
+
+            // If user profile is already configured, sync profile
+            if (localUserId.isNotEmpty() && localCallsign.isNotEmpty()) {
+                val profileCmd = JSONObject().apply {
+                    put("cmd", "set_profile")
+                    put("user_id", localUserId)
+                    put("callsign", localCallsign)
+                }.toString()
+                sendLine(profileCmd)
+            }
+
+            // If location is fresh, sync location
+            if (locationSharingEnabled && lastLatitude != null && lastLongitude != null) {
+                val locCmd = JSONObject().apply {
+                    put("cmd", "set_location")
+                    put("enabled", true)
+                    put("latitude", lastLatitude!!)
+                    put("longitude", lastLongitude!!)
+                }.toString()
+                sendLine(locCmd)
+            }
+        }
+    }
+
+    /**
+     * Informs ESP32 of local user profile.
+     * ESP32 saves to NVS and floods PROFILE mesh announcements.
+     */
+    fun setUserProfile(userId: String, callsign: String) {
+        localUserId = userId
+        localCallsign = callsign
+        if (_state.value == TransportState.CONNECTED) {
+            scope.launch {
+                val cmd = JSONObject().apply {
+                    put("cmd", "set_profile")
+                    put("user_id", userId)
+                    put("callsign", callsign)
+                }.toString()
+                sendLine(cmd)
+            }
+        }
+    }
+
+    /**
+     * Updates phone GPS coordinates sent to ESP32 for PROFILE announcements.
+     * Coordinates are held in ESP32 RAM with a 120s TTL.
+     */
+    fun updateLocation(latitude: Double?, longitude: Double?, enabled: Boolean = true) {
+        lastLatitude = latitude
+        lastLongitude = longitude
+        locationSharingEnabled = enabled
+
+        if (_state.value == TransportState.CONNECTED) {
+            scope.launch {
+                val cmd = JSONObject().apply {
+                    put("cmd", "set_location")
+                    put("enabled", enabled && latitude != null && longitude != null)
+                    if (enabled && latitude != null && longitude != null) {
+                        put("latitude", latitude)
+                        put("longitude", longitude)
+                    }
+                }.toString()
+                sendLine(cmd)
+            }
+        }
+    }
+
+    /**
+     * Sends {"cmd":"status"} to query active status from the node.
+     */
+    fun queryStatus() {
+        scope.launch {
+            sendLine("{\"cmd\":\"status\"}")
+        }
+    }
+
+    /**
+     * Performs serial loopback test {"cmd":"test","action":"serial_loopback","text":...}
+     */
+    fun sendLoopbackTest(text: String) {
+        scope.launch {
+            val cmd = JSONObject().apply {
+                put("cmd", "test")
+                put("action", "serial_loopback")
+                put("text", text)
+            }.toString()
+            sendLine(cmd)
+        }
+    }
+
+    /**
+     * Explicit administrative override for node ID {"cmd":"set_node_id","node_id":...}
+     */
+    fun setNodeId(nodeId: String) {
+        val clean = nodeId.trim().uppercase(Locale.US)
+        if (clean.length == 8) {
+            scope.launch {
+                val cmd = JSONObject().apply {
+                    put("cmd", "set_node_id")
+                    put("node_id", clean)
+                }.toString()
+                sendLine(cmd)
+            }
+        }
+    }
+
+    /**
+     * Generates a monotonic 8-hex digit message ID representing per-sender uint32 sequence.
+     */
+    private fun nextHexMessageId(): String {
+        val nextVal = (messageCounter.incrementAndGet().toLong() and 0xFFFFFFFFL)
+        return String.format(Locale.US, "%08X", nextVal)
+    }
+
+    /**
+     * Resolves an arbitrary destination (VYO user ID, nickname, 8-hex node ID, or broadcast)
+     * to a valid 8-hex node ID.
+     */
+    private fun resolveDestinationHex(destination: String): String {
+        val clean = destination.trim().uppercase(Locale.US)
+        if (clean.isEmpty() || clean == "00000000" || clean == "BROADCAST" || clean == "ALL") {
+            return "00000000"
+        }
+        // Direct 8-hex radio node ID
+        if (clean.matches(Regex("^[0-9A-F]{8}$"))) {
+            return clean
+        }
+        // Check VYORA user ID mapping
+        userIdToNodeId[destination]?.let { return it }
+        userIdToNodeId[clean]?.let { return it }
+        // Check callsign mapping
+        callsignToNodeId[destination]?.let { return it }
+        callsignToNodeId[clean]?.let { return it }
+
+        // Fallback: flood broadcast so receiver node or relays can deliver
+        return "00000000"
+    }
+
+    private fun clampUtf8ToBytes(text: String, maxBytes: Int): String {
+        val bytes = text.toByteArray(StandardCharsets.UTF_8)
+        if (bytes.size <= maxBytes) return text
+        var length = maxBytes
+        while (length > 0) {
+            try {
+                return String(bytes, 0, length, StandardCharsets.UTF_8)
+            } catch (e: Exception) {
+                length--
+            }
+        }
+        return text.take(maxBytes)
+    }
+
     override suspend fun transmit(message: Message): MessageDeliveryStatus {
         if (_state.value != TransportState.CONNECTED) {
             return MessageDeliveryStatus.WAITING_FOR_ROUTE
         }
 
-        // Bench test protocol accepts up to 31 chars per radio transmission
-        val payload = message.text.take(31)
-        val success = sendLine(payload)
-        return if (success) {
-            MessageDeliveryStatus.DELIVERED
+        val destinationHex = resolveDestinationHex(message.recipientId)
+        val hexMsgId = nextHexMessageId()
+
+        // Map hex sequence ID to the app's UUID message ID
+        messageIdMap[hexMsgId] = message.id
+
+        val bodyText = clampUtf8ToBytes(message.text, MAX_RADIO_MESSAGE_BYTES)
+
+        val cmd = JSONObject().apply {
+            put("cmd", "send")
+            put("to", destinationHex)
+            put("message_id", hexMsgId)
+            put("text", bodyText)
+        }.toString()
+
+        val sent = sendLine(cmd)
+        return if (sent) {
+            MessageDeliveryStatus.QUEUED_LOCALLY
         } else {
-            MessageDeliveryStatus.FAILED
+            MessageDeliveryStatus.FAILED_EXPIRED
         }
     }
 
     override suspend fun broadcastSos(alert: SosAlert): Boolean {
-        val payload = "SOS:${alert.category.name}:${alert.senderNickname}".take(31)
-        return sendLine(payload)
+        if (_state.value != TransportState.CONNECTED) return false
+
+        val hexMsgId = nextHexMessageId()
+        val lat = alert.latitude ?: 0.0
+        val lng = alert.longitude ?: 0.0
+        val payload = "SOS:${alert.category.name}:${alert.senderNickname}:$lat:$lng:${alert.note}"
+        val bodyText = clampUtf8ToBytes(payload, MAX_RADIO_MESSAGE_BYTES)
+
+        val cmd = JSONObject().apply {
+            put("cmd", "send")
+            put("to", "00000000") // 00000000 is broadcast
+            put("message_id", hexMsgId)
+            put("text", bodyText)
+        }.toString()
+
+        return sendLine(cmd)
     }
 
     // --- SerialInputOutputManager.Listener Implementation ---
@@ -363,11 +599,7 @@ class UsbSerialTransport(
     }
 
     /**
-     * Parses output from the ESP32 firmware according to ANDROID_HARDWARE_INTEGRATION.md:
-     * - `[received] reply` -> Incoming payload from remote radio node
-     * - `[sent] hello` -> Confirmation that local radio transmitted packet
-     * - `[send failed]` -> Local radio transmission failure
-     * - `Radio ready; listening for NODEB messages.` -> Status line
+     * Parses incoming JSONL lines from the ESP32 nrf_mesh_node firmware.
      */
     private fun processReceivedLine(line: String) {
         val clean = line.trim()
@@ -377,57 +609,217 @@ class UsbSerialTransport(
         scope.launch {
             _incomingLines.emit(clean)
 
-            when {
-                clean.startsWith("[received] ") -> {
-                    val content = clean.removePrefix("[received] ").trim()
-                    _statusMessage.value = "Radio RX: $content"
-
-                    val incomingMsg = Message(
-                        id = "rx-${System.currentTimeMillis()}",
-                        conversationId = "ESP32-PEER",
-                        senderId = "ESP32-PEER",
-                        recipientId = "ME",
-                        text = content,
-                        status = MessageDeliveryStatus.DELIVERED,
-                        type = MessageType.TEXT,
-                        isFromMe = false
-                    )
-                    _receivedMessages.emit(incomingMsg)
-                    updateHardwareNodePresence("ESP32-PEER", ReachabilityStatus.REACHABLE_DIRECT)
+            if (clean.startsWith("{") && clean.endsWith("}")) {
+                try {
+                    val json = JSONObject(clean)
+                    handleJsonEvent(json)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to parse JSON line: $clean", e)
                 }
-                clean.startsWith("[sent] ") -> {
-                    val content = clean.removePrefix("[sent] ").trim()
-                    _statusMessage.value = "Radio TX ACK: $content"
-                }
-                clean.startsWith("[send failed]") -> {
-                    _statusMessage.value = "Radio TX Failed (No ACK from peer)"
-                }
-                clean.contains("Radio ready", ignoreCase = true) || clean.contains("serial bridge", ignoreCase = true) -> {
-                    _statusMessage.value = "Hardware: $clean"
-                }
-                else -> {
-                    _statusMessage.value = "Hardware: $clean"
-                }
+            } else {
+                // Backward-compatibility fallback for bench-test sketches
+                handleBenchTestFallback(clean)
             }
         }
     }
 
-    private fun updateHardwareNodePresence(peerId: String, status: ReachabilityStatus) {
-        _discoveredDevices.update { current ->
-            val existing = current.find { it.deviceId == peerId }
-            if (existing != null) {
-                current.map { if (it.deviceId == peerId) it.copy(reachability = status, rssi = -65) else it }
-            } else {
-                current + NearbyDevice(
-                    deviceId = peerId,
-                    nickname = "Remote nRF24 Node",
-                    reachability = status,
-                    latitude = 37.7750,
-                    longitude = -122.4180,
-                    rssi = -65,
-                    hopCount = 1,
-                    isSimulated = false
+    private suspend fun handleJsonEvent(json: JSONObject) {
+        val eventType = json.optString("event")
+
+        when (eventType) {
+            "ready" -> {
+                val id = json.optString("node_id")
+                val radio = json.optString("radio")
+                val rpd = json.optBoolean("rpd_supported", false)
+                _localNodeId.value = id
+                _radioStatus.value = radio
+                _statusMessage.value = "ESP32 Ready: Node $id • Radio: $radio (RPD: $rpd)"
+
+                // Auto-sync profile and location upon ESP32 reboot/ready
+                performInitialHandshake()
+            }
+
+            "status" -> {
+                val id = json.optString("node_id")
+                val radio = json.optString("radio")
+                val neighbors = json.optInt("neighbors", 0)
+                val userId = json.optString("user_id")
+                val callsign = json.optString("callsign")
+                val locShared = json.optBoolean("location_shared", false)
+
+                _localNodeId.value = id
+                _radioStatus.value = radio
+                _neighborsCount.value = neighbors
+
+                _statusMessage.value = "ESP32 Online: Node $id • Peers: $neighbors • Radio: $radio"
+            }
+
+            "node_seen" -> {
+                val nodeId = json.optString("node_id")
+                val userId = json.optString("user_id")
+                val callsign = json.optString("callsign")
+                val hops = json.optInt("hops", 1)
+                val lastSeenMs = json.optLong("last_seen_ms", System.currentTimeMillis())
+
+                val lat = if (json.has("latitude") && !json.isNull("latitude")) json.optDouble("latitude") else null
+                val lng = if (json.has("longitude") && !json.isNull("longitude")) json.optDouble("longitude") else null
+                val rpd = if (json.has("rpd") && !json.isNull("rpd")) json.optBoolean("rpd") else null
+
+                val record = PeerRecord(
+                    nodeId = nodeId,
+                    userId = userId,
+                    callsign = callsign,
+                    hops = hops,
+                    latitude = lat,
+                    longitude = lng,
+                    rpd = rpd,
+                    lastSeenMs = lastSeenMs
                 )
+                peerTable[nodeId] = record
+                if (userId.isNotEmpty()) userIdToNodeId[userId] = nodeId
+                if (callsign.isNotEmpty()) callsignToNodeId[callsign] = nodeId
+
+                updateDiscoveredDevices()
+                _statusMessage.value = "Peer Discovered: ${callsign.ifEmpty { nodeId }} ($hops hop${if (hops > 1) "s" else ""})"
+            }
+
+            "tx_status" -> {
+                val hexMsgId = json.optString("message_id")
+                val status = json.optString("status")
+                val appMsgId = messageIdMap[hexMsgId]
+
+                if (appMsgId != null) {
+                    when (status) {
+                        "queued" -> _messageStatusUpdates.emit(Pair(appMsgId, MessageDeliveryStatus.QUEUED_LOCALLY))
+                        "transmitted" -> _messageStatusUpdates.emit(Pair(appMsgId, MessageDeliveryStatus.SENT_TO_RELAY))
+                        "transmit_error" -> _messageStatusUpdates.emit(Pair(appMsgId, MessageDeliveryStatus.FAILED_EXPIRED))
+                    }
+                }
+                _statusMessage.value = "Radio TX Status: $status ($hexMsgId)"
+            }
+
+            "delivered" -> {
+                val hexMsgId = json.optString("message_id")
+                val toNode = json.optString("to")
+                val appMsgId = messageIdMap[hexMsgId]
+
+                if (appMsgId != null) {
+                    _messageStatusUpdates.emit(Pair(appMsgId, MessageDeliveryStatus.DELIVERED))
+                }
+                _statusMessage.value = "Delivery Confirmed by $toNode ($hexMsgId)"
+            }
+
+            "delivery_timeout" -> {
+                val hexMsgId = json.optString("message_id")
+                val toNode = json.optString("to")
+                val appMsgId = messageIdMap[hexMsgId]
+
+                if (appMsgId != null) {
+                    _messageStatusUpdates.emit(Pair(appMsgId, MessageDeliveryStatus.FAILED_EXPIRED))
+                }
+                _statusMessage.value = "Delivery Timeout (no ACK from $toNode)"
+            }
+
+            "message" -> {
+                val fromNode = json.optString("from")
+                val toNode = json.optString("to")
+                val hexMsgId = json.optString("message_id")
+                val text = json.optString("text")
+
+                val peer = peerTable[fromNode]
+                val senderId = if (peer != null && peer.userId.isNotEmpty()) peer.userId else fromNode
+
+                val isSos = text.startsWith("SOS:")
+                val incomingMsg = Message(
+                    id = "rx-$fromNode-$hexMsgId",
+                    conversationId = senderId,
+                    senderId = senderId,
+                    recipientId = if (toNode == "00000000") "BROADCAST" else "ME",
+                    text = text,
+                    status = MessageDeliveryStatus.DELIVERED,
+                    type = if (isSos) MessageType.EMERGENCY_ALERT else MessageType.NORMAL,
+                    isFromMe = false
+                )
+                _receivedMessages.emit(incomingMsg)
+                _statusMessage.value = "Radio RX from ${peer?.callsign ?: fromNode}: ${text.take(24)}..."
+            }
+
+            "test_result" -> {
+                val mode = json.optString("mode")
+                val status = json.optString("status")
+                val text = json.optString("text")
+                _statusMessage.value = "Test Result [$mode]: $status - $text"
+            }
+
+            "error" -> {
+                val code = json.optString("code")
+                val hexMsgId = json.optString("message_id")
+                if (hexMsgId.isNotEmpty()) {
+                    messageIdMap[hexMsgId]?.let { appMsgId ->
+                        _messageStatusUpdates.emit(Pair(appMsgId, MessageDeliveryStatus.FAILED_EXPIRED))
+                    }
+                }
+                _statusMessage.value = "ESP32 Error: $code"
+            }
+        }
+    }
+
+    private fun updateDiscoveredDevices() {
+        val devices = peerTable.values.map { peer ->
+            val reachability = if (peer.hops <= 1) ReachabilityStatus.REACHABLE_DIRECT else ReachabilityStatus.REACHABLE_RELAY
+            // Approximate RSSI hint from coarse RPD indicator (threshold ~ -64 dBm)
+            val rssiEstimate = when (peer.rpd) {
+                true -> -60
+                false -> -82
+                null -> if (peer.hops <= 1) -70 else -85
+            }
+
+            NearbyDevice(
+                deviceId = if (peer.userId.isNotEmpty()) peer.userId else peer.nodeId,
+                nickname = if (peer.callsign.isNotEmpty()) peer.callsign else "Node-${peer.nodeId}",
+                reachability = reachability,
+                latitude = peer.latitude,
+                longitude = peer.longitude,
+                rssi = rssiEstimate,
+                hopCount = peer.hops,
+                lastSeenTimestamp = peer.lastSeenMs,
+                isSimulated = false
+            )
+        }
+        _discoveredDevices.value = devices
+        _neighborsCount.value = devices.size
+    }
+
+    /**
+     * Fallback for older bench test firmware output
+     */
+    private suspend fun handleBenchTestFallback(clean: String) {
+        when {
+            clean.startsWith("[received] ") -> {
+                val content = clean.removePrefix("[received] ").trim()
+                _statusMessage.value = "Radio RX: $content"
+
+                val incomingMsg = Message(
+                    id = "rx-${System.currentTimeMillis()}",
+                    conversationId = "ESP32-PEER",
+                    senderId = "ESP32-PEER",
+                    recipientId = "ME",
+                    text = content,
+                    status = MessageDeliveryStatus.DELIVERED,
+                    type = MessageType.NORMAL,
+                    isFromMe = false
+                )
+                _receivedMessages.emit(incomingMsg)
+            }
+            clean.startsWith("[sent] ") -> {
+                val content = clean.removePrefix("[sent] ").trim()
+                _statusMessage.value = "Radio TX ACK: $content"
+            }
+            clean.startsWith("[send failed]") -> {
+                _statusMessage.value = "Radio TX Failed (No ACK from peer)"
+            }
+            else -> {
+                _statusMessage.value = "Hardware: $clean"
             }
         }
     }

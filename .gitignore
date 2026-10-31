@@ -35,3 +35,6 @@ out/
 *.log
 .DS_Store
 Thumbs.db
+
+# Llama.cpp source code
+llama_cpp_src/

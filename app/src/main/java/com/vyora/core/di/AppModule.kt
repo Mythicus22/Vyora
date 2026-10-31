@@ -2,6 +2,7 @@ package com.vyora.core.di
 
 import android.content.Context
 import com.vyora.communication.MessageTransport
+import com.vyora.communication.radio.UsbSerialTransport
 import com.vyora.communication.simulation.SimulatedTransport
 import com.vyora.core.common.AppDispatchers
 import com.vyora.core.location.LocationRepository
