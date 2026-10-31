@@ -32,7 +32,9 @@ class LocationRepository(private val context: Context) : LocationProvider {
     private val fusedClient = LocationServices.getFusedLocationProviderClient(context)
     private val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
 
-    // Initialized to null - no hardcoded San Francisco default
+    private val prefs = context.getSharedPreferences("vyora_location", Context.MODE_PRIVATE)
+
+    // Initialized to saved location or null
     private val _coordinates = MutableStateFlow<LocationCoordinates?>(null)
     override val coordinates: StateFlow<LocationCoordinates?> = _coordinates.asStateFlow()
 
@@ -41,6 +43,18 @@ class LocationRepository(private val context: Context) : LocationProvider {
     private var isUpdating = false
 
     init {
+        val savedLat = prefs.getString("last_lat", null)?.toDoubleOrNull()
+        val savedLng = prefs.getString("last_lng", null)?.toDoubleOrNull()
+        if (savedLat != null && savedLng != null) {
+            _coordinates.value = LocationCoordinates(
+                latitude = savedLat,
+                longitude = savedLng,
+                accuracy = prefs.getFloat("last_acc", 15.0f),
+                altitude = 0.0,
+                timestamp = prefs.getLong("last_time", System.currentTimeMillis())
+            )
+        }
+
         if (hasLocationPermission()) {
             fetchLastKnownLocation()
             startLocationUpdates()
@@ -107,6 +121,12 @@ class LocationRepository(private val context: Context) : LocationProvider {
             timestamp = if (loc.time > 0) loc.time else System.currentTimeMillis()
         )
         _coordinates.value = coords
+        prefs.edit()
+            .putString("last_lat", loc.latitude.toString())
+            .putString("last_lng", loc.longitude.toString())
+            .putFloat("last_acc", loc.accuracy)
+            .putLong("last_time", coords.timestamp)
+            .apply()
         Log.i(TAG, "Acquired real user location: (${loc.latitude}, ${loc.longitude}) ±${loc.accuracy}m")
     }
 

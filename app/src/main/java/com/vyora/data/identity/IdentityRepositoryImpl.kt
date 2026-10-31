@@ -34,6 +34,29 @@ class IdentityRepositoryImpl(private val context: Context) : IdentityRepository 
         prefs[Keys.ONBOARDING_COMPLETED] ?: false
     }
 
+    override suspend fun getStoredUserId(): String? {
+        var existing: String? = null
+        context.vyoraDataStore.edit { prefs ->
+            val id = prefs[Keys.USER_ID]
+            if (!id.isNullOrEmpty()) {
+                existing = id
+            }
+        }
+        return existing
+    }
+
+    override suspend fun getOrCreatePermanentUserId(): String {
+        return getStoredUserId() ?: ""
+    }
+
+    override suspend fun savePermanentNodeId(nodeId: String) {
+        val clean = nodeId.trim().removePrefix("VYO-").removePrefix("vyo-").replace("-", "").replace(":", "").uppercase()
+        val formatted = "VYO-$clean"
+        context.vyoraDataStore.edit { prefs ->
+            prefs[Keys.USER_ID] = formatted
+        }
+    }
+
     override suspend fun saveIdentity(identity: UserIdentity) {
         context.vyoraDataStore.edit { prefs ->
             prefs[Keys.USER_ID] = identity.userId
@@ -45,7 +68,7 @@ class IdentityRepositoryImpl(private val context: Context) : IdentityRepository 
 
     override suspend fun clearIdentity() {
         context.vyoraDataStore.edit { prefs ->
-            prefs.remove(Keys.USER_ID)
+            // Keep USER_ID permanent forever per user specification
             prefs.remove(Keys.NICKNAME)
             prefs.remove(Keys.PUBLIC_KEY)
             prefs[Keys.ONBOARDING_COMPLETED] = false

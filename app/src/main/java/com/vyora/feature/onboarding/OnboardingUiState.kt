@@ -10,5 +10,11 @@ data class OnboardingUiState(
     val emergencyNote: String = "Equipped with offline emergency triage & first aid supplies.",
     val isSaving: Boolean = false,
     val isCompleted: Boolean = false,
-    val existingIdentity: UserIdentity? = null
+    val existingIdentity: UserIdentity? = null,
+    val hasStoredId: Boolean = false,
+    val isEspConnected: Boolean = false,
+    val isIdReadFromEsp: Boolean = false,
+    val espNodeId: String? = null,
+    val espMacAddress: String? = null,
+    val isQueryingSerial: Boolean = false
 )

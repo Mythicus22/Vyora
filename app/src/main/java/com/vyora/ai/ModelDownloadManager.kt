@@ -80,7 +80,9 @@ class ModelDownloadManager(
         const val MODEL_FILENAME = "safora-q4_k_m.gguf"
         const val MODEL_URL = "https://huggingface.co/pragya30/SAFORA/resolve/main/safora-q4_k_m.gguf"
         const val EXPECTED_FILE_SIZE_BYTES = 986048160L
-        const val EXPECTED_SHA256 = "5957685a85e6907667839586e637d388062b3c102df11983843f6ebb46910a07"
+        // Official Git LFS SHA-256 OID from Hugging Face model repository
+        const val EXPECTED_SHA256 = "93a5bd4b4c20a27423b53f416c36eddf74d5966e8b690881adbd9110e7b18224"
+        const val LEGACY_XET_HASH = "5957685a85e6907667839586e637d388062b3c102df11983843f6ebb46910a07"
         const val MIN_FREE_SPACE_BYTES = 1_150_000_000L // 1.15 GB
         private const val BUFFER_SIZE = 64 * 1024 // 64 KB
         private const val MAX_REDIRECTS = 5
@@ -145,6 +147,24 @@ class ModelDownloadManager(
                     Log.i(TAG, "Model already fully downloaded and validated.")
                     _downloadState.value = ModelDownloadState.Installed(modelFile, modelFile.length())
                     return@launch
+                }
+
+                // If partFile is already fully downloaded on device, validate & promote immediately
+                if (partFile.exists() && partFile.length() == EXPECTED_FILE_SIZE_BYTES) {
+                    _downloadState.value = ModelDownloadState.Validating(1.0f)
+                    val actualSha = computeSha256(partFile)
+                    Log.i(TAG, "Checking existing complete part file SHA-256: $actualSha")
+                    val isHashValid = actualSha.equals(EXPECTED_SHA256, ignoreCase = true) ||
+                            actualSha.equals(LEGACY_XET_HASH, ignoreCase = true)
+                    if (isHashValid) {
+                        if (modelFile.exists()) modelFile.delete()
+                        val promoted = partFile.renameTo(modelFile)
+                        if (promoted) {
+                            Log.i(TAG, "Existing part file successfully promoted to $MODEL_FILENAME")
+                            _downloadState.value = ModelDownloadState.Installed(modelFile, modelFile.length())
+                            return@launch
+                        }
+                    }
                 }
 
                 _downloadState.value = ModelDownloadState.CheckingSpace
@@ -314,7 +334,9 @@ class ModelDownloadManager(
             // Verify SHA-256 integrity
             val actualChecksum = computeSha256(partFile)
             Log.i(TAG, "Validation: Calculated SHA-256 = $actualChecksum")
-            if (EXPECTED_SHA256.isNotEmpty() && !actualChecksum.equals(EXPECTED_SHA256, ignoreCase = true)) {
+            val isValid = actualChecksum.equals(EXPECTED_SHA256, ignoreCase = true) ||
+                    actualChecksum.equals(LEGACY_XET_HASH, ignoreCase = true)
+            if (!isValid) {
                 Log.w(TAG, "SHA-256 mismatch! Expected: $EXPECTED_SHA256, Calculated: $actualChecksum")
                 // If checksum failed, report error but preserve part for operator diagnostics
                 throw IllegalStateException("Integrity check failed: SHA-256 checksum mismatch")

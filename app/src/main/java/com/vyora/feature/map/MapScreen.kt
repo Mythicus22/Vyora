@@ -12,6 +12,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -61,6 +62,7 @@ fun MapScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
 
     var showDirectIdDialog by remember { mutableStateOf(false) }
+    var showLiveDevicesSheet by remember { mutableStateOf(false) }
     var mapLibreInstance by remember { mutableStateOf<MapLibreMap?>(null) }
     var isMapLoaded by remember { mutableStateOf(false) }
 
@@ -69,6 +71,18 @@ fun MapScreen(
             "https://tiles.openfreemap.org/styles/bright"
         } else {
             BuildConfig.MAP_STYLE_URL.ifEmpty { "https://tiles.openfreemap.org/styles/dark" }
+        }
+    }
+
+    // Dynamically apply style when user toggles dark / street vector map layers
+    LaunchedEffect(activeStyleUrl, mapLibreInstance) {
+        val map = mapLibreInstance
+        if (map != null && isMapLoaded) {
+            map.setStyle(Style.Builder().fromUri(activeStyleUrl)) {
+                refreshMapMarkers(map, uiState, onDeviceClick = { dev ->
+                    viewModel.selectDevice(dev)
+                })
+            }
         }
     }
 
@@ -84,6 +98,16 @@ fun MapScreen(
                 ),
                 1000
             )
+        }
+    }
+
+    // Reactively refresh map markers whenever mesh devices update or map finishes loading
+    LaunchedEffect(uiState.filteredDevices, uiState.myCoordinates, isMapLoaded, mapLibreInstance) {
+        val map = mapLibreInstance
+        if (map != null && isMapLoaded) {
+            refreshMapMarkers(map, uiState, onDeviceClick = { dev ->
+                viewModel.selectDevice(dev)
+            })
         }
     }
 
@@ -136,7 +160,11 @@ fun MapScreen(
                         }
 
                         map.setOnMarkerClickListener { marker ->
-                            val clicked = uiState.nearbyDevices.find { it.nickname == marker.title }
+                            val clicked = uiState.nearbyDevices.find {
+                                marker.title?.startsWith(it.nickname) == true ||
+                                marker.snippet?.contains(it.deviceId) == true ||
+                                it.nickname == marker.title
+                            }
                             if (clicked != null) {
                                 viewModel.selectDevice(clicked)
                                 true
@@ -254,6 +282,10 @@ fun MapScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { showLiveDevicesSheet = true }
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -261,7 +293,7 @@ fun MapScreen(
                         modifier = Modifier
                             .size(9.dp)
                             .clip(CircleShape)
-                            .background(VyoraMeshGreen)
+                            .background(if (uiState.nearbyDevices.isNotEmpty()) VyoraMeshGreen else VyoraCyanSecondary)
                     )
                     Column {
                         Text(
@@ -273,7 +305,7 @@ fun MapScreen(
                             letterSpacing = 1.sp
                         )
                         Text(
-                            text = "${uiState.nearbyDevices.size} NODES • MapLibre Vector Engine",
+                            text = "${uiState.nearbyDevices.size} NODES ACTIVE • Tap to view",
                             fontSize = 10.sp,
                             color = VyoraCyanLight
                         )
@@ -411,9 +443,17 @@ fun MapScreen(
                 .padding(end = 14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // Layer Toggle (Dark Map / Street Map)
+            // Layer Toggle (Dark Tactical Map / Bright Street Map)
             IconButton(
-                onClick = { viewModel.toggleSatelliteView() },
+                onClick = {
+                    viewModel.toggleSatelliteView()
+                    val willBeBright = !uiState.isSatelliteView
+                    android.widget.Toast.makeText(
+                        context,
+                        if (willBeBright) "Switched to Bright Street Map" else "Switched to Tactical Dark Map",
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                },
                 modifier = Modifier
                     .size(44.dp)
                     .clip(RoundedCornerShape(10.dp))
@@ -422,7 +462,7 @@ fun MapScreen(
             ) {
                 Icon(
                     imageVector = Icons.Default.Layers,
-                    contentDescription = "Toggle Layer",
+                    contentDescription = "Toggle Map Style",
                     tint = if (uiState.isSatelliteView) VyoraCyanSecondary else VyoraTextSecondary,
                     modifier = Modifier.size(20.dp)
                 )
@@ -430,7 +470,15 @@ fun MapScreen(
 
             // Radar Ring Overlay Toggle
             IconButton(
-                onClick = { viewModel.toggleRadarOverlay() },
+                onClick = {
+                    viewModel.toggleRadarOverlay()
+                    val willBeVisible = !uiState.isRadarOverlayVisible
+                    android.widget.Toast.makeText(
+                        context,
+                        if (willBeVisible) "Radar Range Rings: ON" else "Radar Range Rings: OFF",
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                },
                 modifier = Modifier
                     .size(44.dp)
                     .clip(RoundedCornerShape(10.dp))
@@ -445,9 +493,56 @@ fun MapScreen(
                 )
             }
 
+            // Zoom In Button
+            IconButton(
+                onClick = {
+                    mapLibreInstance?.animateCamera(CameraUpdateFactory.zoomIn(), 300)
+                },
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(VyoraNavyCard)
+                    .border(1.dp, VyoraNavyBorder, RoundedCornerShape(10.dp))
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Add,
+                    contentDescription = "Zoom In",
+                    tint = VyoraCyanSecondary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            // Zoom Out Button
+            IconButton(
+                onClick = {
+                    mapLibreInstance?.animateCamera(CameraUpdateFactory.zoomOut(), 300)
+                },
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(VyoraNavyCard)
+                    .border(1.dp, VyoraNavyBorder, RoundedCornerShape(10.dp))
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Remove,
+                    contentDescription = "Zoom Out",
+                    tint = VyoraCyanSecondary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
             // Offline Cache Region Trigger
             IconButton(
-                onClick = { viewModel.cacheCurrentRegion(activeStyleUrl) },
+                onClick = {
+                    val targetLat = uiState.myCoordinates?.latitude ?: mapLibreInstance?.cameraPosition?.target?.latitude
+                    val targetLng = uiState.myCoordinates?.longitude ?: mapLibreInstance?.cameraPosition?.target?.longitude
+                    if (targetLat != null && targetLng != null && (targetLat != 0.0 || targetLng != 0.0)) {
+                        viewModel.cacheCurrentRegion(activeStyleUrl, targetLat, targetLng)
+                        android.widget.Toast.makeText(context, "Caching offline tiles for this region...", android.widget.Toast.LENGTH_SHORT).show()
+                    } else {
+                        android.widget.Toast.makeText(context, "Acquiring GPS location or map center to cache...", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                },
                 modifier = Modifier
                     .size(44.dp)
                     .clip(RoundedCornerShape(10.dp))
@@ -466,14 +561,22 @@ fun MapScreen(
             IconButton(
                 onClick = {
                     viewModel.recenterGps()
-                    uiState.myCoordinates?.let { coords ->
+                    val coords = uiState.myCoordinates
+                    if (coords != null) {
                         mapLibreInstance?.animateCamera(
                             CameraUpdateFactory.newLatLngZoom(
                                 LatLng(coords.latitude, coords.longitude),
-                                14.5
+                                15.0
                             ),
                             800
                         )
+                        android.widget.Toast.makeText(
+                            context,
+                            String.format(java.util.Locale.US, "Centered on GPS (%.4f, %.4f)", coords.latitude, coords.longitude),
+                            android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        android.widget.Toast.makeText(context, "Acquiring real-time GPS fix...", android.widget.Toast.LENGTH_SHORT).show()
                     }
                 },
                 modifier = Modifier
@@ -643,6 +746,159 @@ fun MapScreen(
                 }
             )
         }
+
+        // 7. Live Mesh Nodes Sheet
+        if (showLiveDevicesSheet) {
+            AlertDialog(
+                onDismissRequest = { showLiveDevicesSheet = false },
+                containerColor = VyoraNavyCard,
+                title = {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "LIVE MESH NODES (${uiState.nearbyDevices.size})",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = VyoraTextPrimary
+                        )
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(if (uiState.nearbyDevices.isNotEmpty()) VyoraMeshGreen.copy(alpha = 0.2f) else VyoraEmergencyOrange.copy(alpha = 0.2f))
+                                .padding(horizontal = 8.dp, vertical = 3.dp)
+                        ) {
+                            Text(
+                                text = if (uiState.nearbyDevices.isNotEmpty()) "RF ONLINE" else "LISTENING",
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (uiState.nearbyDevices.isNotEmpty()) VyoraMeshGreen else VyoraEmergencyOrange
+                            )
+                        }
+                    }
+                },
+                text = {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 380.dp)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (uiState.nearbyDevices.isEmpty()) {
+                            Text(
+                                text = "No live mesh peers detected yet.\nEnsure other ESP32 nodes are powered on with RF24 transceivers within 2.4GHz range (Channel 76).",
+                                fontSize = 12.sp,
+                                color = VyoraTextSecondary
+                            )
+                        } else {
+                            uiState.nearbyDevices.forEach { dev ->
+                                Card(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = CardDefaults.cardColors(containerColor = VyoraNavyHighlight),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column {
+                                                Text(dev.nickname, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = VyoraTextPrimary)
+                                                Text("ID: ${dev.deviceId}", fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = VyoraCyanLight)
+                                            }
+                                            Surface(
+                                                color = VyoraNavyDark,
+                                                shape = RoundedCornerShape(4.dp)
+                                            ) {
+                                                Text(
+                                                    text = "${dev.hopCount} hop • ${dev.rssi}dBm",
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                                    fontFamily = FontFamily.Monospace,
+                                                    fontSize = 10.sp,
+                                                    color = VyoraMeshGreen
+                                                )
+                                            }
+                                        }
+
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.End,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            TextButton(
+                                                onClick = {
+                                                    viewModel.selectDevice(dev)
+                                                    showLiveDevicesSheet = false
+                                                    val lat = dev.latitude
+                                                    val lng = dev.longitude
+                                                    if (lat != null && lng != null && (lat != 0.0 || lng != 0.0)) {
+                                                        mapLibreInstance?.animateCamera(
+                                                            CameraUpdateFactory.newLatLngZoom(
+                                                                LatLng(lat, lng),
+                                                                15.0
+                                                            ),
+                                                            800
+                                                        )
+                                                        android.widget.Toast.makeText(context, "Centered on ${dev.nickname} (GPS Fix)", android.widget.Toast.LENGTH_SHORT).show()
+                                                    } else {
+                                                        val myCoords = uiState.myCoordinates
+                                                        if (myCoords != null) {
+                                                            mapLibreInstance?.animateCamera(
+                                                                CameraUpdateFactory.newLatLngZoom(
+                                                                    LatLng(myCoords.latitude, myCoords.longitude),
+                                                                    14.5
+                                                                ),
+                                                                800
+                                                            )
+                                                            android.widget.Toast.makeText(context, "Showing proximity for ${dev.nickname} on radar ring", android.widget.Toast.LENGTH_SHORT).show()
+                                                        } else {
+                                                            android.widget.Toast.makeText(context, "Selected ${dev.nickname} • Radio Link ${dev.hopCount} hop (${dev.rssi} dBm)", android.widget.Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    }
+                                                }
+                                            ) {
+                                                Icon(imageVector = Icons.Default.Explore, contentDescription = null, modifier = Modifier.size(14.dp), tint = VyoraCyanSecondary)
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("Locate", fontSize = 12.sp, color = VyoraCyanSecondary)
+                                            }
+
+                                            Spacer(modifier = Modifier.width(6.dp))
+
+                                            Button(
+                                                onClick = {
+                                                    showLiveDevicesSheet = false
+                                                    onStartChat(dev.deviceId)
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = VyoraCyanSecondary, contentColor = VyoraNavyDark),
+                                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                                shape = RoundedCornerShape(6.dp)
+                                            ) {
+                                                Icon(imageVector = Icons.Default.Chat, contentDescription = null, modifier = Modifier.size(14.dp))
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("Chat", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showLiveDevicesSheet = false }) {
+                        Text("Close", color = VyoraCyanLight)
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -668,12 +924,55 @@ private fun refreshMapMarkers(
 
     // Add Discovered Peer Markers
     uiState.filteredDevices.forEach { device ->
-        if (device.latitude != null && device.longitude != null) {
+        val hasExactGps = device.latitude != null && device.longitude != null && (device.latitude != 0.0 || device.longitude != 0.0)
+        val lat: Double
+        val lng: Double
+        val isEstimated: Boolean
+
+        if (hasExactGps) {
+            lat = device.latitude!!
+            lng = device.longitude!!
+            isEstimated = false
+        } else if (uiState.myCoordinates != null) {
+            // Project proximity on radar ring around local node using deterministic hash of deviceId
+            val hash = Math.abs(device.deviceId.hashCode())
+            val angleRad = Math.toRadians((hash % 360).toDouble())
+            val radiusMeters = when (device.hopCount) {
+                1 -> 80.0 + (hash % 60)
+                2 -> 250.0 + (hash % 100)
+                else -> 500.0 + (hash % 150)
+            }
+            val deltaLat = (radiusMeters * Math.cos(angleRad)) / 111320.0
+            val deltaLng = (radiusMeters * Math.sin(angleRad)) / (111320.0 * Math.cos(Math.toRadians(uiState.myCoordinates.latitude)))
+            lat = uiState.myCoordinates.latitude + deltaLat
+            lng = uiState.myCoordinates.longitude + deltaLng
+            isEstimated = true
+        } else {
+            val center = map.cameraPosition.target
+            if (center != null && (center.latitude != 0.0 || center.longitude != 0.0)) {
+                val hash = Math.abs(device.deviceId.hashCode())
+                val angleRad = Math.toRadians((hash % 360).toDouble())
+                val radiusMeters = 150.0 + (hash % 100)
+                val deltaLat = (radiusMeters * Math.cos(angleRad)) / 111320.0
+                val deltaLng = (radiusMeters * Math.sin(angleRad)) / (111320.0 * Math.cos(Math.toRadians(center.latitude)))
+                lat = center.latitude + deltaLat
+                lng = center.longitude + deltaLng
+                isEstimated = true
+            } else {
+                lat = 0.0
+                lng = 0.0
+                isEstimated = true
+            }
+        }
+
+        if (lat != 0.0 && lng != 0.0) {
+            val title = if (isEstimated) "${device.nickname} (Radio Signal)" else device.nickname
+            val snippet = "ID: ${device.deviceId} • RSSI: ${device.rssi}dBm • Hops: ${device.hopCount}${if (isEstimated) " [Estimated Proximity]" else " [GPS Fix]"}"
             map.addMarker(
                 org.maplibre.android.annotations.MarkerOptions()
-                    .position(LatLng(device.latitude, device.longitude))
-                    .title(device.nickname)
-                    .snippet("ID: ${device.deviceId} • RSSI: ${device.rssi}dBm")
+                    .position(LatLng(lat, lng))
+                    .title(title)
+                    .snippet(snippet)
             )
         }
     }

@@ -35,6 +35,7 @@ import com.vyora.feature.onboarding.OnboardingViewModel
 import com.vyora.feature.settings.SettingsScreen
 import com.vyora.feature.sos.SosScreen
 import com.vyora.feature.sos.SosViewModel
+import com.vyora.feature.terminal.TerminalScreen
 
 @Composable
 fun AppNavHost(
@@ -55,18 +56,19 @@ fun AppNavHost(
     val showBottomBar = currentRoute in listOf(
         AppRoute.Map.route,
         AppRoute.Assistant.route,
-        AppRoute.Messages.route
+        AppRoute.Messages.route,
+        AppRoute.Terminal.route
     )
 
     val context = androidx.compose.ui.platform.LocalContext.current
     // ViewModels
-    val onboardingViewModel = remember { OnboardingViewModel(identityRepository) }
+    val onboardingViewModel = remember { OnboardingViewModel(identityRepository, transport) }
     val deviceRepo = remember { DeviceRepositoryImpl(transport) }
     val offlineMapTileManager = remember { com.vyora.core.location.OfflineMapTileManager(context) }
     val mapViewModel = remember { MapViewModel(locationProvider, deviceRepo, offlineMapTileManager) }
     val assistantRepo = remember { AssistantRepositoryImpl(context.applicationContext, EmergencyKnowledgeRepository()) }
     val assistantViewModel = remember { AssistantViewModel(assistantRepo) }
-    val messagingViewModel = remember { MessagingViewModel(messageRepository) }
+    val messagingViewModel = remember { MessagingViewModel(messageRepository, deviceRepo) }
     val sosViewModel = remember { SosViewModel(messageRepository) }
 
     val coordinates by locationProvider.coordinates.collectAsState()
@@ -93,7 +95,7 @@ fun AppNavHost(
         ) { innerPadding ->
             NavHost(
                 navController = navController,
-                startDestination = if (isOnboardingDone) AppRoute.Map.route else AppRoute.Onboarding.route,
+                startDestination = AppRoute.Onboarding.route,
                 modifier = Modifier.padding(innerPadding)
             ) {
                 composable(AppRoute.Onboarding.route) {
@@ -150,6 +152,7 @@ fun AppNavHost(
                 composable(AppRoute.EmergencyGuides.route) { EmergencyGuidesScreen() }
                 composable(AppRoute.Settings.route) { SettingsScreen() }
                 composable(AppRoute.Diagnostics.route) { DiagnosticsScreen(transport = transport) }
+                composable(AppRoute.Terminal.route) { TerminalScreen(transport = transport) }
             }
         }
 

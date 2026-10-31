@@ -36,26 +36,23 @@ class SosViewModel(
         _uiState.update { it.copy(note = note) }
     }
 
-    fun startCountdown(myUserId: String, myNickname: String, lat: Double?, lng: Double?) {
-        _uiState.update { it.copy(countdownSeconds = 5) }
+    fun triggerInstantSos(myUserId: String, myNickname: String, lat: Double?, lng: Double?) {
+        _uiState.update { it.copy(isTransmitting = true, countdownSeconds = null) }
         viewModelScope.launch {
-            while ((_uiState.value.countdownSeconds ?: 0) > 0) {
-                delay(1000)
-                _uiState.update { it.copy(countdownSeconds = (it.countdownSeconds ?: 1) - 1) }
-            }
-            if (_uiState.value.countdownSeconds == 0) {
-                _uiState.update { it.copy(countdownSeconds = null, isTransmitting = true) }
-                triggerSosUseCase(
-                    myUserId = myUserId,
-                    myNickname = myNickname,
-                    category = _uiState.value.selectedCategory,
-                    lat = lat,
-                    lng = lng,
-                    note = _uiState.value.note
-                )
-                _uiState.update { it.copy(isTransmitting = false) }
-            }
+            triggerSosUseCase(
+                myUserId = myUserId,
+                myNickname = myNickname,
+                category = _uiState.value.selectedCategory,
+                lat = lat,
+                lng = lng,
+                note = _uiState.value.note
+            )
+            _uiState.update { it.copy(isTransmitting = false) }
         }
+    }
+
+    fun startCountdown(myUserId: String, myNickname: String, lat: Double?, lng: Double?) {
+        triggerInstantSos(myUserId, myNickname, lat, lng)
     }
 
     fun cancelCountdown() {

@@ -11,7 +11,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 class MessagingViewModel(
-    private val messageRepository: MessageRepository
+    private val messageRepository: MessageRepository,
+    private val deviceRepository: com.vyora.domain.repository.DeviceRepository? = null
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(MessagingUiState())
@@ -23,6 +24,43 @@ class MessagingViewModel(
                 _uiState.update { it.copy(conversations = convs) }
             }
         }
+        deviceRepository?.let { repo ->
+            viewModelScope.launch {
+                repo.nearbyDevices.collect { devs ->
+                    _uiState.update { it.copy(discoveredDevices = devs) }
+                }
+            }
+        }
+    }
+
+    fun isDeviceValid(id: String): Boolean {
+        val clean = id.trim().uppercase()
+        if (clean.length < 2) return false
+
+        // Matches discovered node or nickname
+        val devices = _uiState.value.discoveredDevices
+        val matchesDiscovered = devices.any {
+            it.deviceId.equals(clean, ignoreCase = true) ||
+            it.nickname.equals(clean, ignoreCase = true) ||
+            com.vyora.domain.usecase.CreateIdentityUseCase.extractNodeId(it.deviceId).equals(
+                com.vyora.domain.usecase.CreateIdentityUseCase.extractNodeId(clean),
+                ignoreCase = true
+            )
+        }
+        if (matchesDiscovered) return true
+
+        // Direct 8-hex node ID (e.g. 1A2B3C4D)
+        if (clean.matches(Regex("^[0-9A-F]{8}$"))) return true
+
+        // Formatted VYO ID (e.g. VYO-1A2B3C4D)
+        if (clean.startsWith("VYO-") && clean.length >= 6) return true
+
+        // MAC address format with colons/dashes or 12 hex chars
+        val stripped = clean.replace(":", "").replace("-", "")
+        if (stripped.length == 12 && stripped.all { it in "0123456789ABCDEF" }) return true
+
+        // Valid alphanumeric callsign or node identifier
+        return clean.length in 2..32 && clean.all { it.isLetterOrDigit() || it == '-' || it == '_' || it == ':' }
     }
 
     fun selectConversation(peerId: String) {

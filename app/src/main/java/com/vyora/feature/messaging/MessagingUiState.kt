@@ -7,5 +7,6 @@ data class MessagingUiState(
     val conversations: List<Conversation> = emptyList(),
     val currentMessages: List<Message> = emptyList(),
     val activePeerId: String? = null,
-    val inputText: String = ""
+    val inputText: String = "",
+    val discoveredDevices: List<com.vyora.domain.model.NearbyDevice> = emptyList()
 )

@@ -57,11 +57,13 @@ class MapViewModel(
         _uiState.update { it.copy(isSatelliteView = !it.isSatelliteView) }
     }
 
-    fun cacheCurrentRegion(styleUrl: String) {
-        val coords = _uiState.value.myCoordinates ?: return
+    fun cacheCurrentRegion(styleUrl: String, centerLat: Double? = null, centerLng: Double? = null) {
+        val lat = centerLat ?: _uiState.value.myCoordinates?.latitude
+        val lng = centerLng ?: _uiState.value.myCoordinates?.longitude
+        if (lat == null || lng == null) return
         offlineMapTileManager?.cacheRegionAround(
-            centerLat = coords.latitude,
-            centerLng = coords.longitude,
+            centerLat = lat,
+            centerLng = lng,
             styleUrl = styleUrl
         )
     }

@@ -164,19 +164,25 @@ void formatId(uint32_t value, char output[9]) {
 }
 
 bool parseId(const char* text, uint32_t& value) {
-  if (text == nullptr || strlen(text) != 8) {
+  if (text == nullptr) {
     return false;
   }
-  value = 0;
-  for (uint8_t i = 0; i < 8; ++i) {
-    char c = text[i];
-    uint8_t digit;
-    if (c >= '0' && c <= '9') digit = c - '0';
-    else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
-    else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
-    else return false;
-    value = (value << 4) | digit;
+  while (*text == ' ') ++text;
+  if (strncmp(text, "0x", 2) == 0 || strncmp(text, "0X", 2) == 0) {
+    text += 2;
+  } else if (strncmp(text, "VYO-", 4) == 0 || strncmp(text, "vyo-", 4) == 0) {
+    text += 4;
   }
+  size_t len = strlen(text);
+  if (len == 0 || len > 8) {
+    return false;
+  }
+  char* endPtr = nullptr;
+  unsigned long parsed = strtoul(text, &endPtr, 16);
+  if (endPtr == nullptr || *endPtr != '\0') {
+    return false;
+  }
+  value = static_cast<uint32_t>(parsed);
   return true;
 }
 
@@ -186,15 +192,27 @@ void emitStatus() {
   formatId(nodeId, idText);
   event["event"] = "status";
   event["node_id"] = idText;
+
+  char macText[18];
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(macText, sizeof(macText), "%02X:%02X:%02X:%02X:%02X:%02X",
+           static_cast<uint8_t>(mac >> 40), static_cast<uint8_t>(mac >> 32),
+           static_cast<uint8_t>(mac >> 24), static_cast<uint8_t>(mac >> 16),
+           static_cast<uint8_t>(mac >> 8), static_cast<uint8_t>(mac));
+  event["mac"] = macText;
+
   event["radio"] = radioReady ? "ready" : "error";
-  event["neighbors"] = 0;
   uint8_t count = 0;
   for (const Peer& peer : peers) if (peer.active) ++count;
   event["neighbors"] = count;
   event["user_id"] = localUserId;
   event["callsign"] = localCallsign;
-  bool locationFresh = localLocationEnabled && millis() - localLocationUpdatedAt <= MeshConfig::LOCATION_TTL_MS;
+  bool locationFresh = localLocationEnabled && (millis() - localLocationUpdatedAt <= MeshConfig::LOCATION_TTL_MS);
   event["location_shared"] = locationFresh;
+  if (locationFresh) {
+    event["latitude"] = localLatitude;
+    event["longitude"] = localLongitude;
+  }
   serializeJson(event, Serial);
   Serial.println();
 }
@@ -469,9 +487,13 @@ void processComplete(Assembly& assembly) {
         Peer* peer = getPeer(source);
         strlcpy(peer->userId, profile["user_id"] | "", sizeof(peer->userId));
         strlcpy(peer->callsign, profile["callsign"] | "", sizeof(peer->callsign));
-        if (profile["latitude"].is<float>() && profile["longitude"].is<float>()) {
-          float latitude = profile["latitude"].as<float>();
-          float longitude = profile["longitude"].as<float>();
+
+        bool hasLat = profile.containsKey("latitude") || profile.containsKey("lat");
+        bool hasLng = profile.containsKey("longitude") || profile.containsKey("lng") || profile.containsKey("lon");
+        if (hasLat && hasLng) {
+          float latitude = profile.containsKey("latitude") ? profile["latitude"].as<float>() : profile["lat"].as<float>();
+          float longitude = profile.containsKey("longitude") ? profile["longitude"].as<float>() :
+                            (profile.containsKey("lon") ? profile["lon"].as<float>() : profile["lng"].as<float>());
           peer->locationAvailable = isfinite(latitude) && isfinite(longitude) &&
                                     latitude >= -90.0f && latitude <= 90.0f &&
                                     longitude >= -180.0f && longitude <= 180.0f;
@@ -537,7 +559,12 @@ void handleFrame(const MeshFrame& frame, bool rpdKnown, bool rpd) {
 
   bool duplicate = seenOrImprove(frame);
   if (frame.type == MeshConfig::TYPE_HELLO) {
-    if (!duplicate) emitNodeSeen(source, hops, rpdKnown, rpd);
+    if (!duplicate) {
+      emitNodeSeen(source, hops, rpdKnown, rpd);
+      if (static_cast<int32_t>(nextProfileAt - millis()) > 2500) {
+        nextProfileAt = millis() + random(400, 1200);
+      }
+    }
   } else if (frame.type == MeshConfig::TYPE_ACK) {
     if (destination == nodeId) {
       int8_t slot = findPending(source, message);
@@ -575,9 +602,20 @@ bool sendFragmented(uint8_t type, uint32_t destination, uint32_t message,
 }
 
 void announceProfile() {
-  if (localUserId[0] == '\0' || localCallsign[0] == '\0' || !radioReady) return;
+  if (localUserId[0] == '\0') {
+    char idText[9];
+    formatId(nodeId, idText);
+    snprintf(localUserId, sizeof(localUserId), "VYO-%s", idText);
+  }
+  if (localCallsign[0] == '\0') {
+    char idText[9];
+    formatId(nodeId, idText);
+    snprintf(localCallsign, sizeof(localCallsign), "Node-%s", idText + 4);
+  }
+  if (!radioReady) return;
+
   bool includeLocation = localLocationEnabled &&
-                         millis() - localLocationUpdatedAt <= MeshConfig::LOCATION_TTL_MS;
+                         (millis() - localLocationUpdatedAt <= MeshConfig::LOCATION_TTL_MS);
   if (localLocationEnabled && !includeLocation) localLocationEnabled = false;
   StaticJsonDocument<256> profile;
   profile["user_id"] = localUserId;
@@ -708,8 +746,12 @@ void handleCommand(char* line) {
     preferences.putString("callsign", localCallsign);
     emitStatus();
     announceProfile();
-  } else if (strcmp(name, "set_location") == 0) {
-    bool enabled = command["enabled"] | false;
+  } else if (strcmp(name, "set_location") == 0 || strcmp(name, "location") == 0 || strcmp(name, "gps") == 0 || strcmp(name, "set_gps") == 0) {
+    bool hasLat = command.containsKey("latitude") || command.containsKey("lat");
+    bool hasLng = command.containsKey("longitude") || command.containsKey("lng") || command.containsKey("lon");
+    bool hasEnabled = command.containsKey("enabled");
+    bool enabled = hasEnabled ? command["enabled"].as<bool>() : (hasLat && hasLng);
+
     if (!enabled) {
       localLocationEnabled = false;
       localLatitude = 0;
@@ -719,12 +761,13 @@ void handleCommand(char* line) {
       announceProfile();
       return;
     }
-    if (!command["latitude"].is<float>() || !command["longitude"].is<float>()) {
+    if (!hasLat || !hasLng) {
       emitError("invalid_location");
       return;
     }
-    float latitude = command["latitude"].as<float>();
-    float longitude = command["longitude"].as<float>();
+    float latitude = command.containsKey("latitude") ? command["latitude"].as<float>() : command["lat"].as<float>();
+    float longitude = command.containsKey("longitude") ? command["longitude"].as<float>() :
+                      (command.containsKey("lon") ? command["lon"].as<float>() : command["lng"].as<float>());
     if (!isfinite(latitude) || !isfinite(longitude) || latitude < -90.0f || latitude > 90.0f ||
         longitude < -180.0f || longitude > 180.0f) {
       emitError("invalid_location");
@@ -861,11 +904,19 @@ void setup() {
     rpdSupported = radio.isPVariant();
   }
 
-  StaticJsonDocument<256> ready;
+  char macText[18];
+  uint64_t mac = ESP.getEfuseMac();
+  snprintf(macText, sizeof(macText), "%02X:%02X:%02X:%02X:%02X:%02X",
+           static_cast<uint8_t>(mac >> 40), static_cast<uint8_t>(mac >> 32),
+           static_cast<uint8_t>(mac >> 24), static_cast<uint8_t>(mac >> 16),
+           static_cast<uint8_t>(mac >> 8), static_cast<uint8_t>(mac));
+
+  StaticJsonDocument<384> ready;
   char idText[9];
   formatId(nodeId, idText);
   ready["event"] = "ready";
   ready["node_id"] = idText;
+  ready["mac"] = macText;
   ready["radio"] = radioReady ? "ready" : "error";
   ready["user_id"] = localUserId;
   ready["callsign"] = localCallsign;

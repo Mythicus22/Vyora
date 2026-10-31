@@ -103,6 +103,9 @@ class UsbSerialTransport(
     private val _localNodeId = MutableStateFlow<String?>(null)
     val localNodeId: StateFlow<String?> = _localNodeId.asStateFlow()
 
+    private val _localMacAddress = MutableStateFlow<String?>(null)
+    val localMacAddress: StateFlow<String?> = _localMacAddress.asStateFlow()
+
     private val _radioStatus = MutableStateFlow("unknown")
     val radioStatus: StateFlow<String> = _radioStatus.asStateFlow()
 
@@ -332,6 +335,7 @@ class UsbSerialTransport(
         _state.value = TransportState.DISCONNECTED
         _statusMessage.value = "Hardware disconnected. Reconnect OTG cable."
         _localNodeId.value = null
+        _localMacAddress.value = null
         _radioStatus.value = "offline"
         _neighborsCount.value = 0
     }
@@ -369,6 +373,7 @@ class UsbSerialTransport(
         scope.launch {
             // Request node status
             sendLine("{\"cmd\":\"status\"}")
+            kotlinx.coroutines.delay(150)
 
             // If user profile is already configured, sync profile
             if (localUserId.isNotEmpty() && localCallsign.isNotEmpty()) {
@@ -378,6 +383,7 @@ class UsbSerialTransport(
                     put("callsign", localCallsign)
                 }.toString()
                 sendLine(profileCmd)
+                kotlinx.coroutines.delay(150)
             }
 
             // If location is fresh, sync location
@@ -394,8 +400,7 @@ class UsbSerialTransport(
     }
 
     /**
-     * Informs ESP32 of local user profile.
-     * ESP32 saves to NVS and floods PROFILE mesh announcements.
+     * Informs ESP32 of local user profile without overwriting hardware node ID.
      */
     fun setUserProfile(userId: String, callsign: String) {
         localUserId = userId
@@ -495,6 +500,10 @@ class UsbSerialTransport(
         // Direct 8-hex radio node ID
         if (clean.matches(Regex("^[0-9A-F]{8}$"))) {
             return clean
+        }
+        val extracted = com.vyora.domain.usecase.CreateIdentityUseCase.extractNodeId(clean)
+        if (extracted.matches(Regex("^[0-9A-F]{8}$")) && extracted != "00000000") {
+            return extracted
         }
         // Check VYORA user ID mapping
         userIdToNodeId[destination]?.let { return it }
@@ -629,11 +638,13 @@ class UsbSerialTransport(
         when (eventType) {
             "ready" -> {
                 val id = json.optString("node_id")
+                val mac = json.optString("mac")
                 val radio = json.optString("radio")
                 val rpd = json.optBoolean("rpd_supported", false)
-                _localNodeId.value = id
+                if (id.isNotEmpty()) _localNodeId.value = id
+                if (mac.isNotEmpty()) _localMacAddress.value = mac
                 _radioStatus.value = radio
-                _statusMessage.value = "ESP32 Ready: Node $id • Radio: $radio (RPD: $rpd)"
+                _statusMessage.value = "ESP32 Ready: Node $id${if (mac.isNotEmpty()) " (MAC: $mac)" else ""} • Radio: $radio (RPD: $rpd)"
 
                 // Auto-sync profile and location upon ESP32 reboot/ready
                 performInitialHandshake()
@@ -641,17 +652,19 @@ class UsbSerialTransport(
 
             "status" -> {
                 val id = json.optString("node_id")
+                val mac = json.optString("mac")
                 val radio = json.optString("radio")
                 val neighbors = json.optInt("neighbors", 0)
                 val userId = json.optString("user_id")
                 val callsign = json.optString("callsign")
                 val locShared = json.optBoolean("location_shared", false)
 
-                _localNodeId.value = id
+                if (id.isNotEmpty()) _localNodeId.value = id
+                if (mac.isNotEmpty()) _localMacAddress.value = mac
                 _radioStatus.value = radio
                 _neighborsCount.value = neighbors
 
-                _statusMessage.value = "ESP32 Online: Node $id • Peers: $neighbors • Radio: $radio"
+                _statusMessage.value = "ESP32 Online: Node $id${if (mac.isNotEmpty()) " (MAC: $mac)" else ""} • Peers: $neighbors • Radio: $radio"
             }
 
             "node_seen" -> {
@@ -659,28 +672,39 @@ class UsbSerialTransport(
                 val userId = json.optString("user_id")
                 val callsign = json.optString("callsign")
                 val hops = json.optInt("hops", 1)
-                val lastSeenMs = json.optLong("last_seen_ms", System.currentTimeMillis())
+                val now = System.currentTimeMillis()
 
-                val lat = if (json.has("latitude") && !json.isNull("latitude")) json.optDouble("latitude") else null
-                val lng = if (json.has("longitude") && !json.isNull("longitude")) json.optDouble("longitude") else null
+                val rawLat = if (json.has("latitude") && !json.isNull("latitude")) json.optDouble("latitude")
+                             else if (json.has("lat") && !json.isNull("lat")) json.optDouble("lat")
+                             else null
+                val rawLng = if (json.has("longitude") && !json.isNull("longitude")) json.optDouble("longitude")
+                             else if (json.has("lon") && !json.isNull("lon")) json.optDouble("lon")
+                             else if (json.has("lng") && !json.isNull("lng")) json.optDouble("lng")
+                             else null
                 val rpd = if (json.has("rpd") && !json.isNull("rpd")) json.optBoolean("rpd") else null
+
+                val existing = peerTable[nodeId]
+                val effectiveLat = if (rawLat != null && rawLat != 0.0) rawLat else existing?.latitude
+                val effectiveLng = if (rawLng != null && rawLng != 0.0) rawLng else existing?.longitude
+                val effectiveUserId = userId.ifEmpty { existing?.userId ?: "" }
+                val effectiveCallsign = callsign.ifEmpty { existing?.callsign ?: "" }
 
                 val record = PeerRecord(
                     nodeId = nodeId,
-                    userId = userId,
-                    callsign = callsign,
+                    userId = effectiveUserId,
+                    callsign = effectiveCallsign,
                     hops = hops,
-                    latitude = lat,
-                    longitude = lng,
-                    rpd = rpd,
-                    lastSeenMs = lastSeenMs
+                    latitude = effectiveLat,
+                    longitude = effectiveLng,
+                    rpd = rpd ?: existing?.rpd,
+                    lastSeenMs = now
                 )
                 peerTable[nodeId] = record
-                if (userId.isNotEmpty()) userIdToNodeId[userId] = nodeId
-                if (callsign.isNotEmpty()) callsignToNodeId[callsign] = nodeId
+                if (effectiveUserId.isNotEmpty()) userIdToNodeId[effectiveUserId] = nodeId
+                if (effectiveCallsign.isNotEmpty()) callsignToNodeId[effectiveCallsign] = nodeId
 
                 updateDiscoveredDevices()
-                _statusMessage.value = "Peer Discovered: ${callsign.ifEmpty { nodeId }} ($hops hop${if (hops > 1) "s" else ""})"
+                _statusMessage.value = "Peer Discovered: ${effectiveCallsign.ifEmpty { nodeId }} ($hops hop${if (hops > 1) "s" else ""})"
             }
 
             "tx_status" -> {

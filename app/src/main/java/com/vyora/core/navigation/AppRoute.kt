@@ -13,4 +13,5 @@ sealed class AppRoute(val route: String) {
     object EmergencyGuides : AppRoute("emergency_guides")
     object Settings : AppRoute("settings")
     object Diagnostics : AppRoute("diagnostics")
+    object Terminal : AppRoute("terminal")
 }

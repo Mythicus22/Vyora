@@ -4,6 +4,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -17,8 +18,9 @@ enum class BottomNavigationItem(
     val icon: ImageVector
 ) {
     MAP(AppRoute.Map.route, "Map", Icons.Default.Map),
+    MESSAGES(AppRoute.Messages.route, "Messages", Icons.Default.Chat),
     ASSISTANT(AppRoute.Assistant.route, "AI Assistant", Icons.Default.SmartToy),
-    MESSAGES(AppRoute.Messages.route, "Messages", Icons.Default.Chat)
+    TERMINAL(AppRoute.Terminal.route, "Terminal", Icons.Default.Terminal)
 }
 
 @Composable

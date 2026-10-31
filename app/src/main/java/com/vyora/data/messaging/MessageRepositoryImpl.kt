@@ -62,6 +62,30 @@ class MessageRepositoryImpl(
         currentList.add(incoming)
         _messages.value = _messages.value.toMutableMap().apply { put(targetPeer, currentList) }
 
+        // If incoming packet is an emergency broadcast, alert this listening node immediately
+        if (incoming.type == MessageType.EMERGENCY_ALERT || incoming.text.startsWith("SOS:")) {
+            val parts = incoming.text.split(":")
+            val cat = if (parts.size > 1) {
+                try { EmergencyCategory.valueOf(parts[1]) } catch (e: Exception) { EmergencyCategory.GENERAL }
+            } else EmergencyCategory.GENERAL
+            val senderNick = if (parts.size > 2 && parts[2].isNotEmpty()) parts[2] else targetPeer
+            val lat = if (parts.size > 3) parts[3].toDoubleOrNull() else null
+            val lng = if (parts.size > 4) parts[4].toDoubleOrNull() else null
+            val note = if (parts.size > 5 && parts[5].isNotEmpty()) parts[5] else "Emergency broadcast received from $senderNick"
+
+            val incomingAlert = SosAlert(
+                alertId = incoming.id,
+                senderId = targetPeer,
+                senderNickname = senderNick,
+                category = cat,
+                latitude = lat,
+                longitude = lng,
+                note = note,
+                isSafe = false
+            )
+            _activeSos.value = incomingAlert
+        }
+
         val convList = _conversations.value.toMutableList()
         val existingIndex = convList.indexOfFirst { it.recipientId == targetPeer }
         val updatedConv = Conversation(
@@ -76,53 +100,10 @@ class MessageRepositoryImpl(
         _conversations.value = convList
     }
 
-    private val _conversations = MutableStateFlow<List<Conversation>>(
-        listOf(
-            Conversation(
-                id = "conv-1",
-                recipientId = "VYO-8K42-99P1",
-                recipientNickname = "Relay-Bravo",
-                lastMessageText = "Sub-GHz 915MHz active beacon verified.",
-                lastMessageTimestamp = System.currentTimeMillis() - 120_000
-            ),
-            Conversation(
-                id = "conv-2",
-                recipientId = "VYO-3X99-2A1B",
-                recipientNickname = "FieldMedic-Sarah",
-                lastMessageText = "First aid supply station established at Sector 4.",
-                lastMessageTimestamp = System.currentTimeMillis() - 600_000,
-                unreadCount = 1
-            )
-        )
-    )
+    private val _conversations = MutableStateFlow<List<Conversation>>(emptyList())
     override val conversations: StateFlow<List<Conversation>> = _conversations.asStateFlow()
 
-    private val _messages = MutableStateFlow<Map<String, List<Message>>>(
-        mapOf(
-            "VYO-8K42-99P1" to listOf(
-                Message(
-                    id = "m1",
-                    conversationId = "conv-1",
-                    senderId = "VYO-8K42-99P1",
-                    recipientId = "ME",
-                    text = "Sub-GHz 915MHz active beacon verified.",
-                    status = MessageDeliveryStatus.DELIVERED,
-                    isFromMe = false
-                )
-            ),
-            "VYO-3X99-2A1B" to listOf(
-                Message(
-                    id = "m2",
-                    conversationId = "conv-2",
-                    senderId = "VYO-3X99-2A1B",
-                    recipientId = "ME",
-                    text = "First aid supply station established at Sector 4.",
-                    status = MessageDeliveryStatus.DELIVERED,
-                    isFromMe = false
-                )
-            )
-        )
-    )
+    private val _messages = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     override val messages: StateFlow<Map<String, List<Message>>> = _messages.asStateFlow()
 
     private val _activeSos = MutableStateFlow<SosAlert?>(null)
